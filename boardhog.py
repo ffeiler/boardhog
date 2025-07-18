@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""BoardHog: Monitor who's using SpiNNaker2 boards.
+"""BoardHog: Monitor SpiNNaker2 board usage with traffic light indicators.
 
 This tool shows which boards are locked, who's using them, and for how long.
-It scans for /tmp/s2*_lock files and presents the information in a clear format.
+It scans /tmp/s2*_lock files and displays board status in a clean format.
+
+Monitored boards:
+    - Fixed boards: 1.53, 2.52, 3.24
+    - Dynamic boards: 4.xx (placeholder when free) or actual 4.* IPs when in use
 
 Requirements:
     - Python 3.6+
@@ -10,44 +14,46 @@ Requirements:
 
 Installation:
     1. Make the script executable:
-       chmod +x boardhog.py
+       chmod +x ~/boardhog/boardhog.py
 
     2. Create a symlink in your PATH (optional):
        mkdir -p ~/.local/bin
-       ln -sf $(pwd)/boardhog.py ~/.local/bin/boardhog
+       ln -sf ~/boardhog/boardhog.py ~/.local/bin/boardhog
 
     3. Ensure ~/.local/bin is in your PATH:
        echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
        source ~/.bashrc
 
 Usage:
-    boardhog                     # Display current board usage
-    boardhog --help              # Show help
+    ~/boardhog/boardhog.py       # Run directly
+    boardhog                     # If symlinked
     watch -n .5 boardhog         # Monitor in real-time
 
 Status Indicators:
-    😊 < 1 minute: Normal usage
-    😐 1-5 minutes: OK
-    😠 > 5 minutes: Getting long
-    😡 > 30 minutes: Time to investigate!
+    🟢 Board is free
+    🟡 Used < 1 minute
+    🟠 Used 1-5 minutes
+    🔴 Used > 5 minutes
+
+Output Format:
+    <ip_suffix> <status_indicator> [username]
 
 Examples:
-    # Check who's using boards right now
-    boardhog
+    # Check current board status
+    ~/boardhog/boardhog.py
+    # Output: 1.53 🟢
+    #         2.52 🟠 username
+    #         4.xx 🟢
 
     # Monitor continuously (refresh every 0.5 seconds)
     watch -n .5 boardhog
 
-    # Use in a script
+    # Filter for specific users
     boardhog | grep "username"
-
-    # Check specific board types
-    boardhog | grep "ETH"
 """
 
 import argparse
 import re
-import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -68,35 +74,58 @@ def extract_ip_suffix(filepath):
     return "N/A"
 
 
-def extract_board_type(filename):
-    """Extract board type from a lock filename.
+def get_status_indicator(time_category, time_since):
+    """Get traffic light status indicator based on usage time.
 
     Args:
-        filename: Lock filename (e.g., 's2_eth_lock_192.168.1.53').
+        time_category: Category from get_time_since ('seconds', 'minutes', 'hours', 'days').
+        time_since: Time string from get_time_since (e.g., '5m ago').
 
     Returns:
-        Board type in uppercase (e.g., 'ETH', 'USB') or 'UNK' if not recognized.
+        Traffic light emoji: 🟡 < 1min, 🟠 1-5min, 🔴 > 5min.
     """
-    match = re.search(r"s2_(\w+)_lock", filename)
-    if match:
-        return match.group(1).upper()
-    return "UNK"
+    if (
+        time_category == "days"
+        or (time_category == "hours")
+        or (time_category == "minutes" and int(time_since.split("m")[0]) > 5)
+    ):
+        return "🔴"  # Red - over 5 minutes
+    elif time_category == "minutes" and int(time_since.split("m")[0]) >= 1:
+        return "🟠"  # Orange - 1-5 minutes
+    else:
+        return "🟡"  # Yellow - less than 1 minute
 
 
-def get_terminal_width():
-    """Get terminal width with sensible defaults.
+def get_all_board_ips():
+    """Get all board IPs to monitor.
 
     Returns:
-        Terminal width between 60-120 columns, or 80 if detection fails.
+        List of IP suffixes. Fixed boards (1.53, 2.52, 3.24) plus either:
+        - '4.xx' placeholder when no 4.* boards are in use, or
+        - Actual 4.* IP suffixes when boards are locked (e.g., '4.15')
     """
+    fixed_boards = ["1.53", "2.52", "3.24"]
+
+    # For 4.* boards, discover them by checking for any existing lock files
+    dynamic_boards = set()
+
     try:
-        # Get terminal size from shutil
-        columns, _ = shutil.get_terminal_size()
-        # Use at least 60 columns, at most 120 columns
-        return max(60, min(columns, 120))
-    except (AttributeError, ValueError, IOError):
-        # Default terminal width if detection fails
-        return 80
+        # Check for any 4.* lock files that might exist
+        import glob
+
+        lock_files = glob.glob("/tmp/s2*_lock_192.168.4.*")
+        for lock_file in lock_files:
+            ip_suffix = extract_ip_suffix(lock_file)
+            if ip_suffix.startswith("4."):
+                dynamic_boards.add(ip_suffix)
+    except Exception:
+        pass
+
+    # If no 4.* boards are in use, show placeholder
+    if not dynamic_boards:
+        dynamic_boards.add("4.xx")
+
+    return fixed_boards + sorted(list(dynamic_boards))
 
 
 def get_time_since(date_str, time_str):
@@ -146,8 +175,7 @@ def parse_ls_line(line):
         Dictionary with extracted information or None if the line format is invalid.
 
     Keys in returned dictionary:
-        filename, date, time, ip_suffix, board_type,
-        time_since, time_category, username
+        filename, date, time, ip_suffix, time_since, time_category, username
     """
     # Example: -rw-rw-rw- 1 username     username     0 Jul  7 15:35 /tmp/s2_eth_lock_192.168.1.53
     parts = line.strip().split()
@@ -166,9 +194,8 @@ def parse_ls_line(line):
     day = parts[6]
     time = parts[7]
 
-    # Extract IP suffix and board type
+    # Extract IP suffix
     ip_suffix = extract_ip_suffix(filepath)
-    board_type = extract_board_type(filename)
     time_since, time_category = get_time_since(f"{month} {day}", time)
 
     return {
@@ -176,7 +203,6 @@ def parse_ls_line(line):
         "date": f"{month} {day}",
         "time": time,
         "ip_suffix": ip_suffix,
-        "board_type": board_type,
         "time_since": time_since,
         "time_category": time_category,
         "username": username,
@@ -201,7 +227,10 @@ def get_board_status():
 
 
 def print_board_hoggers(lines=None):
-    """Print board usage information in a formatted table.
+    """Display board status with traffic light indicators.
+
+    Shows each board's IP suffix, status (🟢🟡🟠🔴), and username if locked.
+    Format: <ip_suffix> <status_indicator> [username]
 
     Args:
         lines: Optional list of ls output lines. If None, fetches current status.
@@ -209,147 +238,55 @@ def print_board_hoggers(lines=None):
     if lines is None:
         lines = get_board_status()
 
-    # Get current terminal width
-    term_width = get_terminal_width()
-
-    # Header with emoji but no colors
-    print("=" * term_width)
-    title = "🐷  BOARD HOG SHAME BOARD  🐷"
-    padding = " " * ((term_width - len(title)) // 2)
-    print(f"{padding}{title}")
-    print("=" * term_width)
-
-    # Get column widths based on terminal width
-    term_width = get_terminal_width()
-
-    # Calculate proportional column widths - adjust ratios as needed
-    board_width = max(8, int(term_width * 0.10))  # 10% of width, at least 8 chars
-    hogged_width = max(12, int(term_width * 0.15))  # 15% of width, at least 12 chars
-    since_width = max(12, int(term_width * 0.15))  # 15% of width, at least 12 chars
-    hogger_width = max(25, term_width - board_width - hogged_width - since_width - 5)  # Remaining space
-
-    if not lines:
-        print()
-
-        no_boards_msg = "🎉 ALL BOARDS ARE FREE! NOBODY IS HOGGING! 🎉"
-        hooray_msg = "🌈 EVERYONE IS SHARING NICELY TODAY! 🌈"
-
-        # Center the messages
-        padding1 = " " * ((term_width - len(no_boards_msg)) // 2)
-        padding2 = " " * ((term_width - len(hooray_msg)) // 2)
-
-        print(f"{padding1}{no_boards_msg}")
-        print(f"{padding2}{hooray_msg}")
-        print()
-        return
-
-    # Table header
+    # Simple functional header
+    print("Board Status")
     print()
-    print(
-        f"{'BOARD':<{board_width}} "
-        f"{'HOGGED FOR':<{hogged_width}} "
-        f"{'SINCE':<{since_width}} "
-        f"{'HOGGER':<{hogger_width}}"
-    )
-    print("-" * term_width)
 
-    board_count = 0
+    # Parse all lock files
+    locked_boards = {}
     for line in lines:
         if not line.strip() or line.startswith("total"):
             continue
 
         parsed = parse_ls_line(line)
         if parsed:
-            board_count += 1
+            locked_boards[parsed["ip_suffix"]] = parsed
 
-            # Shame level determination based on tolerance levels:
-            # < 1 minute: completely fine (green emoji)
-            # 1-5 minutes: ok (yellow emoji)
-            # > 5 minutes: concerning (red emoji)
-            # > 30 minutes: angry (red emoji with angry face)
+    # Get known board IPs and check status
+    known_ips = get_all_board_ips()
 
-            time_category = parsed["time_category"]
-            time_since = parsed["time_since"]
+    # Also include any 4.* boards found in lock files
+    for ip_suffix in locked_boards.keys():
+        if ip_suffix.startswith("4.") and ip_suffix not in known_ips:
+            known_ips.append(ip_suffix)
 
-            if (
-                time_category == "days"
-                or (time_category == "hours")
-                or (time_category == "minutes" and int(time_since.split("m")[0]) > 30)
-            ):
-                # Over 30 minutes = ANGRY
-                shame_emoji = "😡"
-            elif time_category == "minutes" and int(time_since.split("m")[0]) > 5:
-                # Over 5 minutes = concerning
-                shame_emoji = "😠"
-            elif time_category == "minutes" and int(time_since.split("m")[0]) > 1:
-                # 1-5 minutes = ok
-                shame_emoji = "😐"
-            else:
-                # Less than 1 minute = completely fine
-                shame_emoji = "😊"
+    # Sort IPs for consistent display
+    known_ips.sort()
 
-            # Get username for display
-            hogger_name = parsed["username"]
-
-            # Create the blame message with status emoji + username
-            blame_msg = f"{shame_emoji} {hogger_name}"
-
-            # Use IP suffix as the board identifier
-            board_id = f"{parsed['ip_suffix']}"
-
-            print(
-                f"{board_id:<{board_width}} "
-                f"{parsed['time_since']:<{hogged_width}} "
-                f"{parsed['time']:<{since_width}} "
-                f"{blame_msg:<{hogger_width}}"
-            )
-
-    # Footer with statistics
-    print("=" * term_width)
-    if board_count > 0:
-        if board_count > 3:
-            # Critical situation - lots of hogged boards
-            alert_border = "🚨 " + "!" * (term_width - 6) + " 🚨"
-
-            alert_msg = f"🔥 WHOA! {board_count} boards?! Someone's building their own supercomputer! 🔥"
-            urgent_msg = "🔪 Hide your boards! The board vigilante is on the hunt! 🔪"
-
-            # Center the messages
-            padding1 = " " * ((term_width - len(alert_msg)) // 2)
-            padding2 = " " * ((term_width - len(urgent_msg)) // 2)
-
-            print(alert_border)
-            print(f"{padding1}{alert_msg}")
-            print(f"{padding2}{urgent_msg}")
-            print(alert_border)
+    # Display each board
+    for ip_suffix in known_ips:
+        if ip_suffix in locked_boards:
+            # Board is locked
+            parsed = locked_boards[ip_suffix]
+            status = get_status_indicator(parsed["time_category"], parsed["time_since"])
+            hogger = parsed["username"]
+            print(f"{ip_suffix} {status} {hogger}")
         else:
-            # Normal situation - some boards hogged
-            hogged_msg = f"{board_count} board{'s' if board_count > 1 else ''} being hogged!"
-            remind_msg = "🚪 Knock knock... it's the board liberation squad! 🔪"
+            # Board is free
+            print(f"{ip_suffix} 🟢")
 
-            # Center the messages
-            padding1 = " " * ((term_width - len(hogged_msg)) // 2)
-            padding2 = " " * ((term_width - len(remind_msg)) // 2)
-
-            print(f"{padding1}{hogged_msg}")
-            print(f"{padding2}{remind_msg}")
-    else:
-        # No boards hogged - celebrate!
-        celebration_msg = "🎉 AMAZING! NO ACTIVE BOARD HOGGERS DETECTED! 🎉"
-        nice_msg = "🌟 Everyone's being considerate today! 🌟"
-
-        # Center the messages
-        padding1 = " " * ((term_width - len(celebration_msg)) // 2)
-        padding2 = " " * ((term_width - len(nice_msg)) // 2)
-
-        print(f"{padding1}{celebration_msg}")
-        print(f"{padding2}{nice_msg}")
+    # Also check for any other 4.* boards in lock files that we might have missed
+    for ip_suffix, parsed in locked_boards.items():
+        if ip_suffix.startswith("4.") and ip_suffix not in known_ips:
+            status = get_status_indicator(parsed["time_category"], parsed["time_since"])
+            hogger = parsed["username"]
+            print(f"{ip_suffix} {status} {hogger}")
 
 
 def main():
-    """Main function to handle command line arguments."""
+    """Main function to handle command line arguments and display board status."""
     parser = argparse.ArgumentParser(
-        description="BoardHog: Monitor who's using SpiNNaker2 boards",
+        description="BoardHog: Monitor SpiNNaker2 board usage with traffic light indicators",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -357,7 +294,7 @@ Examples:
     watch -n .5 boardhog         # Monitor in real-time
     
 Status indicators:
-    😊 < 1 min    😐 1-5 min    😠 > 5 min    😡 > 30 min
+    🟢 Free    🟡 < 1min    🟠 1-5min    🔴 > 5min
         """,
     )
 
@@ -371,7 +308,7 @@ Status indicators:
         else:
             print_board_hoggers()
     except KeyboardInterrupt:
-        print("\n🏃 Board hogger hunt cancelled!")
+        print("\nMonitoring stopped.")
     except BrokenPipeError:
         # Handle broken pipe gracefully when piping to other commands
         pass
