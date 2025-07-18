@@ -90,7 +90,7 @@ def get_status_indicator(time_category, time_since):
         or (time_category == "minutes" and int(time_since.split("m")[0]) > 5)
     ):
         return "🔴"  # Red - over 5 minutes
-    elif time_category == "minutes" and int(time_since.split("m")[0]) >= 1:
+    elif time_category == "minutes" and int(time_since.split("m")[0]) > 1:
         return "🟠"  # Orange - 1-5 minutes
     else:
         return "🟡"  # Yellow - less than 1 minute
