@@ -312,7 +312,10 @@ def compact(row: Row, full_ip: bool, show_pid: bool, plain: bool) -> str:
 
     pid = f" PID={row.holder.pid}" if show_pid else ""
     age = duration(row.holder.age_seconds)
-    return f"{label:<15} {symbol} {row.holder.user} {age} {row.holder.command}{pid} ({row.board.label})"
+    user = f"{row.holder.user:<12}"
+    age_col = f"{age:<8}"
+    command = f"{row.holder.command:<10}"
+    return f"{label:<15} {symbol} {user} {age_col} {command}{pid} ({row.board.label})"
 
 
 def detailed(row: Row) -> str:

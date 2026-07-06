@@ -2,9 +2,7 @@
 
 Small CLI for py-spinnaker2 board locks.
 
-Reads the config root from `/etc/opt/spinnaker/SPINNAKER_CONFIG_PATH`, loads `spinnaker2_network_config.yml`, and checks `/mnt/spinnaker/locks/BOARD_*.lock` through `/proc/locks`.
-
-Lock files are placeholders. A board is busy only while a process holds the file lock.
+Board inventory comes from the SpiNNaker2 network config. `boardhog` shows locked boards by default.
 
 ## Status Indicators
 
