@@ -6,6 +6,12 @@ Reads the config root from `/etc/opt/spinnaker/SPINNAKER_CONFIG_PATH`, loads `sp
 
 Lock files are placeholders. A board is busy only while a process holds the file lock.
 
+## Status Indicators
+
+🟢 `free` • 🟡 `short` (<1 min) • 🟠 `medium` (1-5 min) • 🔴 `long` (>5 min) • `?` `missing`
+
+`boardhog` shows locked boards by default. Use `--all` to include free and missing boards.
+
 ## Install
 
 ```bash
@@ -52,8 +58,4 @@ Locked Boards
 alias watch_locks='watch -n 1 -d boardhog'
 ```
 
-## Status Indicators
 
-🟢 `free` • 🟡 `short` (<1 min) • 🟠 `medium` (1-5 min) • 🔴 `long` (>5 min) • `?` `missing`
-
-`boardhog` shows locked boards by default. Use `--all` to include free and missing boards.
