@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=64.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "boardhog"
+version = "0.1.0"
+description = "Monitor py-spinnaker2 board locks"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+boardhog = "boardhog:main"
+
+[tool.setuptools]
+py-modules = ["boardhog"]
+
+[tool.ruff]
+line-length = 120
+indent-width = 4
+fix = true
+output-format = "grouped"
+show-fixes = true
+lint.ignore = ["E731", "E741"]
+
+[tool.ruff.format]
+docstring-code-format = true
+indent-style = "space"
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"

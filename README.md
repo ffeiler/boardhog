@@ -1,35 +1,57 @@
 # BoardHog
 
-Monitor SpiNNaker2 board usage with traffic light indicators.
+Small CLI for py-spinnaker2 board locks.
 
-## Status Indicators
-🟢 Free • 🟡 < 1min • 🟠 1-5min • 🔴 > 5min
+Reads the config root from `/etc/opt/spinnaker/SPINNAKER_CONFIG_PATH`, loads `spinnaker2_network_config.yml`, and checks `/mnt/spinnaker/locks/BOARD_*.lock` through `/proc/locks`.
 
-## Installation
+Lock files are placeholders. A board is busy only while a process holds the file lock.
+
+## Install
+
 ```bash
-chmod +x ~/boardhog/boardhog.py
-mkdir -p ~/.local/bin
-ln -sf ~/boardhog/boardhog.py ~/.local/bin/boardhog
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+python -m pip install -e ~/boardhog
 ```
 
-## Usage
+Or keep the existing symlink:
+
 ```bash
-boardhog                    # Check current status
-watch -n .5 boardhog        # Real-time monitoring
-boardhog | grep username    # Filter by user
+ln -sf ~/boardhog/boardhog.py ~/.local/bin/boardhog
+```
+
+## Use
+
+```bash
+boardhog                         # locked boards only, emoji
+boardhog --all                   # include free and missing boards
+boardhog --plain --no-header     # script-friendly text
+boardhog --details               # full IP, lock file, PID, command, age
+boardhog --json                  # locked boards as compact JSON
+boardhog --json --pretty         # readable JSON
+watch_locks                      # zsh alias
 ```
 
 ## Output
-```
-Board Status
 
-1.53 🟢
-2.52 🟠 alice
-3.24 🟢
-4.xx 🟢
+```text
+Locked Boards
+
+1.11            🔴 alice 12m 04s python (frame_5)
 ```
 
-**Boards monitored**: 1.53, 2.52, 3.24, 4.xx (placeholder) / 4.* (when in use)
+```text
+192.168.1.11    (BOARD_192_168_1_11.lock): locked by alice (PID=1234, CMD=python) for 12m 04s
+```
 
-**Requirements**: Python 3.6+, access to `/tmp/s2*_lock*` files
+```json
+[{"ip":"192.168.1.11","state":"long","holder":{"pid":"1234","user":"alice","command":"python","age_seconds":724,"age":"12m 04s"}}]
+```
+
+## Alias
+
+```zsh
+alias watch_locks='watch -n 1 -d boardhog'
+```
+
+## States
+
+`boardhog` shows `short`, `medium`, and `long` by default. Use `--all` to include `free` and `missing`.

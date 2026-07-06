@@ -1,317 +1,416 @@
 #!/usr/bin/env python3
-"""BoardHog: Monitor SpiNNaker2 board usage with traffic light indicators.
+"""Monitor py-spinnaker2 board locks."""
 
-This tool shows which boards are locked, who's using them, and for how long.
-It scans /tmp/s2*_lock files and displays board status in a clean format.
-
-Monitored boards:
-    - Fixed boards: 1.53, 2.52, 3.24
-    - Dynamic boards: 4.xx (placeholder when free) or actual 4.* IPs when in use
-
-Requirements:
-    - Python 3.6+
-    - Access to /tmp/ directory with s2 lock files
-
-Installation:
-    1. Make the script executable:
-       chmod +x ~/boardhog/boardhog.py
-
-    2. Create a symlink in your PATH (optional):
-       mkdir -p ~/.local/bin
-       ln -sf ~/boardhog/boardhog.py ~/.local/bin/boardhog
-
-    3. Ensure ~/.local/bin is in your PATH:
-       echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-       source ~/.bashrc
-
-Usage:
-    ~/boardhog/boardhog.py       # Run directly
-    boardhog                     # If symlinked
-    watch -n .5 boardhog         # Monitor in real-time
-
-Status Indicators:
-    🟢 Board is free
-    🟡 Used < 1 minute
-    🟠 Used 1-5 minutes
-    🔴 Used > 5 minutes
-
-Output Format:
-    <ip_suffix> <status_indicator> [username]
-
-Examples:
-    # Check current board status
-    ~/boardhog/boardhog.py
-    # Output: 1.53 🟢
-    #         2.52 🟠 username
-    #         4.xx 🟢
-
-    # Monitor continuously (refresh every 0.5 seconds)
-    watch -n .5 boardhog
-
-    # Filter for specific users
-    boardhog | grep "username"
-"""
+from __future__ import annotations
 
 import argparse
+import glob
+import ipaddress
+import json
+import os
+import pwd
 import re
-import subprocess
 import sys
-from datetime import datetime
+from dataclasses import dataclass
+from pathlib import Path
 
 
-def extract_ip_suffix(filepath):
-    """Extract the last two octets of IP address from a filepath.
+CONFIG_POINTER = Path("/etc/opt/spinnaker/SPINNAKER_CONFIG_PATH")
+DEFAULT_CONFIG_ROOT = Path("/mnt/spinnaker")
+NETWORK_CONFIG = "spinnaker2_network_config.yml"
+LOCKS_DIR = "locks"
+LOCK_PREFIX = "BOARD_"
+LOCK_SUFFIX = ".lock"
 
-    Args:
-        filepath: Path containing an IP address (e.g., '/tmp/s2_eth_lock_192.168.1.53').
+BOARD_TYPES = {
+    "201": "single-chip",
+    "248": "48-node",
+}
 
-    Returns:
-        The last two octets (e.g., '1.53') or 'N/A' if not found.
-    """
-    match = re.search(r"(\d+)\.(\d+)\.(\d+)\.(\d+)", filepath)
-    if match:
-        return f"{match.group(3)}.{match.group(4)}"
-    return "N/A"
+SYMBOLS = {
+    "free": "🟢",
+    "short": "🟡",
+    "medium": "🟠",
+    "long": "🔴",
+    "missing": "?",
+}
 
-
-def get_status_indicator(time_category, time_since):
-    """Get traffic light status indicator based on usage time.
-
-    Args:
-        time_category: Category from get_time_since ('seconds', 'minutes', 'hours', 'days').
-        time_since: Time string from get_time_since (e.g., '5m ago').
-
-    Returns:
-        Traffic light emoji: 🟡 < 1min, 🟠 1-5min, 🔴 > 5min.
-    """
-    if (
-        time_category == "days"
-        or (time_category == "hours")
-        or (time_category == "minutes" and int(time_since.split("m")[0]) > 5)
-    ):
-        return "🔴"  # Red - over 5 minutes
-    elif time_category == "minutes" and int(time_since.split("m")[0]) > 1:
-        return "🟠"  # Orange - 1-5 minutes
-    else:
-        return "🟡"  # Yellow - less than 1 minute
+DEV_INODE_RE = re.compile(r"^([0-9a-fA-F]+:[0-9a-fA-F]+):(\d+)$")
+PID_RE = re.compile(r"^-?\d+$")
 
 
-def get_all_board_ips():
-    """Get all board IPs to monitor.
+@dataclass(frozen=True)
+class Board:
+    ip: str
+    machine: str | None = None
+    board_id: int | None = None
+    board_type: str | None = None
+    n_boards: int = 1
+    configured: bool = True
 
-    Returns:
-        List of IP suffixes. Fixed boards (1.53, 2.52, 3.24) plus either:
-        - '4.xx' placeholder when no 4.* boards are in use, or
-        - Actual 4.* IP suffixes when boards are locked (e.g., '4.15')
-    """
-    fixed_boards = ["1.53", "2.52", "3.24"]
+    @property
+    def lock_name(self) -> str:
+        return f"{LOCK_PREFIX}{self.ip.replace('.', '_')}{LOCK_SUFFIX}"
 
-    # For 4.* boards, discover them by checking for any existing lock files
-    dynamic_boards = set()
+    @property
+    def label(self) -> str:
+        if not self.machine:
+            return "unconfigured"
+        if self.n_boards > 1 and self.board_id is not None:
+            return f"{self.machine}[{self.board_id}]"
+        return self.machine
+
+    @property
+    def type_label(self) -> str | None:
+        return BOARD_TYPES.get(str(self.board_type), self.board_type) if self.board_type else None
+
+
+@dataclass(frozen=True)
+class Holder:
+    pid: str
+    user: str
+    command: str
+    age_seconds: int | None
+
+
+@dataclass(frozen=True)
+class Row:
+    board: Board
+    lock_path: Path
+    holder: Holder | None
+    lock_file_exists: bool
+
+    @property
+    def state(self) -> str:
+        if not self.lock_file_exists:
+            return "missing"
+        if self.holder is None:
+            return "free"
+        return age_state(self.holder.age_seconds)
+
+
+def read_config_root(pointer: Path = CONFIG_POINTER) -> Path:
+    try:
+        value = pointer.read_text().strip()
+    except OSError:
+        return DEFAULT_CONFIG_ROOT
+    return Path(value) if value else DEFAULT_CONFIG_ROOT
+
+
+def parse_network_config(path: Path) -> list[tuple[str, dict[str, str]]]:
+    machines: list[tuple[str, dict[str, str]]] = []
+    name: str | None = None
+    data: dict[str, str] = {}
 
     try:
-        # Check for any 4.* lock files that might exist
-        import glob
+        lines = path.read_text().splitlines()
+    except OSError:
+        return machines
 
-        lock_files = glob.glob("/tmp/s2*_lock_192.168.4.*")
-        for lock_file in lock_files:
-            ip_suffix = extract_ip_suffix(lock_file)
-            if ip_suffix.startswith("4."):
-                dynamic_boards.add(ip_suffix)
-    except Exception:
-        pass
+    for raw_line in lines:
+        line = raw_line.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        if not line.startswith((" ", "\t")) and line.endswith(":"):
+            if name is not None:
+                machines.append((name, data))
+            name = line[:-1].strip()
+            data = {}
+            continue
+        if name is None or ":" not in line:
+            continue
+        key, value = line.strip().split(":", 1)
+        data[key.strip()] = value.strip().strip("'\"")
 
-    # If no 4.* boards are in use, show placeholder
-    if not dynamic_boards:
-        dynamic_boards.add("4.xx")
-
-    return fixed_boards + sorted(list(dynamic_boards))
+    if name is not None:
+        machines.append((name, data))
+    return machines
 
 
-def get_time_since(date_str, time_str):
-    """Calculate time elapsed since file creation.
+def configured_boards(config_root: Path) -> list[Board]:
+    boards: list[Board] = []
 
-    Args:
-        date_str: Date string in format 'Mon DD' (e.g., 'Jul 7').
-        time_str: Time string in format 'HH:MM' (e.g., '15:35').
+    for machine, data in parse_network_config(config_root / NETWORK_CONFIG):
+        start_ip = data.get("ETH_IP_START")
+        if not start_ip:
+            continue
+        try:
+            n_boards = int(data.get("n_boards", "1"))
+            first_ip = ipaddress.ip_address(start_ip)
+        except ValueError:
+            continue
 
-    Returns:
-        A tuple of (formatted_time_string, category) where:
-        - formatted_time_string: Human-readable time (e.g., '5m ago')
-        - category: One of 'seconds', 'minutes', 'hours', or 'days'
-    """
+        for board_id in range(n_boards):
+            boards.append(
+                Board(
+                    ip=str(first_ip + board_id),
+                    machine=machine,
+                    board_id=board_id,
+                    board_type=data.get("type"),
+                    n_boards=n_boards,
+                )
+            )
+
+    return boards
+
+
+def inventory(config_root: Path, locks_dir: Path, include_unconfigured: bool) -> list[Board]:
+    boards = {board.ip: board for board in configured_boards(config_root)}
+
+    if include_unconfigured:
+        pattern = str(locks_dir / f"{LOCK_PREFIX}*{LOCK_SUFFIX}")
+        for lock_file in glob.glob(pattern):
+            ip = ip_from_lock_name(Path(lock_file).name)
+            if ip and ip not in boards:
+                boards[ip] = Board(ip=ip, configured=False)
+
+    return sorted(boards.values(), key=lambda board: ip_key(board.ip))
+
+
+def ip_from_lock_name(name: str) -> str | None:
+    if not name.startswith(LOCK_PREFIX) or not name.endswith(LOCK_SUFFIX):
+        return None
+    parts = name[len(LOCK_PREFIX) : -len(LOCK_SUFFIX)].split("_")
+    if len(parts) != 4 or not all(part.isdigit() for part in parts):
+        return None
+    ip = ".".join(parts)
     try:
-        # Parse the date and time
-        current_year = datetime.now().year
-        file_datetime = datetime.strptime(f"{current_year} {date_str} {time_str}", "%Y %b %d %H:%M")
-
-        # If the parsed date is in the future, it's probably from last year
-        if file_datetime > datetime.now():
-            file_datetime = file_datetime.replace(year=current_year - 1)
-
-        time_diff = datetime.now() - file_datetime
-
-        if time_diff.days > 0:
-            return f"{time_diff.days}d ago", "days"
-        elif time_diff.seconds > 3600:
-            hours = time_diff.seconds // 3600
-            return f"{hours}h ago", "hours"
-        elif time_diff.seconds > 60:
-            minutes = time_diff.seconds // 60
-            return f"{minutes}m ago", "minutes"
-        else:
-            return "now", "seconds"
-    except Exception:
-        return "???", "unknown"
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    return ip
 
 
-def parse_ls_line(line):
-    """Parse a single line from ls -lct output.
+def ip_key(ip: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in ip.split("."))
 
-    Args:
-        line: A line from 'ls -lct' (e.g., '-rw-rw-rw- 1 username username 0 Jul 7 15:35 /tmp/s2_eth_lock_192.168.1.53').
 
-    Returns:
-        Dictionary with extracted information or None if the line format is invalid.
+def ip_suffix(ip: str) -> str:
+    parts = ip.split(".")
+    return f"{parts[2]}.{parts[3]}" if len(parts) == 4 else ip
 
-    Keys in returned dictionary:
-        filename, date, time, ip_suffix, time_since, time_category, username
-    """
-    # Example: -rw-rw-rw- 1 username     username     0 Jul  7 15:35 /tmp/s2_eth_lock_192.168.1.53
-    parts = line.strip().split()
-    if len(parts) < 9:
+
+def proc_locks(path: Path = Path("/proc/locks")) -> dict[tuple[str, str], str]:
+    locks: dict[tuple[str, str], str] = {}
+
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return locks
+
+    for line in lines:
+        fields = line.split()
+        for index, field in enumerate(fields[:-1]):
+            if not PID_RE.match(field):
+                continue
+            match = DEV_INODE_RE.match(fields[index + 1])
+            if match and field != "-1":
+                locks.setdefault((match.group(1).lower(), match.group(2)), field)
+            break
+
+    return locks
+
+
+def lock_key(path: Path) -> tuple[str, str] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    device = f"{os.major(stat.st_dev):02x}:{os.minor(stat.st_dev):02x}"
+    return (device.lower(), str(stat.st_ino))
+
+
+def rows(config_root: Path, locks_dir: Path, include_unconfigured: bool) -> list[Row]:
+    locks = proc_locks()
+    result: list[Row] = []
+
+    for board in inventory(config_root, locks_dir, include_unconfigured):
+        lock_path = locks_dir / board.lock_name
+        key = lock_key(lock_path)
+        pid = locks.get(key) if key else None
+        result.append(Row(board, lock_path, holder(pid) if pid else None, lock_path.exists()))
+
+    return result
+
+
+def holder(pid: str) -> Holder:
+    uid = process_uid(pid)
+    user = user_from_uid(uid) if uid is not None else f"PID={pid}"
+    command = read_text(Path("/proc") / pid / "comm") or "unknown"
+    return Holder(pid=pid, user=user, command=command, age_seconds=process_age_seconds(pid))
+
+
+def process_uid(pid: str) -> int | None:
+    try:
+        with (Path("/proc") / pid / "status").open() as handle:
+            for line in handle:
+                if line.startswith("Uid:"):
+                    return int(line.split()[1])
+    except (OSError, IndexError, ValueError):
+        return None
+    return None
+
+
+def user_from_uid(uid: int) -> str:
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return f"uid={uid}"
+
+
+def read_text(path: Path) -> str | None:
+    try:
+        return path.read_text().strip()
+    except OSError:
         return None
 
-    # Extract filename (last part)
-    filepath = parts[-1]
-    filename = filepath.split("/")[-1]
 
-    # Extract username (owner) - 3rd part
-    username = parts[2] if len(parts) >= 3 else "unknown"
+def process_age_seconds(pid: str) -> int | None:
+    stat = read_text(Path("/proc") / pid / "stat")
+    uptime = read_text(Path("/proc/uptime"))
+    if not stat or not uptime:
+        return None
+    try:
+        tail = stat.rsplit(")", 1)[1].split()
+        started_at = int(tail[19]) / os.sysconf("SC_CLK_TCK")
+        return max(0, int(float(uptime.split()[0]) - started_at))
+    except (IndexError, OSError, TypeError, ValueError):
+        return None
 
-    # Extract date and time (parts 5, 6, 7)
-    month = parts[5]
-    day = parts[6]
-    time = parts[7]
 
-    # Extract IP suffix
-    ip_suffix = extract_ip_suffix(filepath)
-    time_since, time_category = get_time_since(f"{month} {day}", time)
+def age_state(seconds: int | None) -> str:
+    if seconds is None or seconds > 300:
+        return "long"
+    if seconds >= 60:
+        return "medium"
+    return "short"
+
+
+def duration(seconds: int | None) -> str:
+    if seconds is None:
+        return "unknown"
+    minutes, seconds = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    if days:
+        return f"{days}d {hours:02d}h {minutes:02d}m"
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
+
+
+def compact(row: Row, full_ip: bool, show_pid: bool, plain: bool) -> str:
+    label = row.board.ip if full_ip else ip_suffix(row.board.ip)
+    symbol = status_symbol(row.state, plain)
+
+    if row.state == "missing":
+        return f"{label:<15} {symbol} missing {row.board.lock_name}"
+    if row.holder is None:
+        return f"{label:<15} {symbol} {row.board.label}"
+
+    pid = f" PID={row.holder.pid}" if show_pid else ""
+    age = duration(row.holder.age_seconds)
+    return f"{label:<15} {symbol} {row.holder.user} {age} {row.holder.command}{pid} ({row.board.label})"
+
+
+def detailed(row: Row) -> str:
+    prefix = f"{row.board.ip:<15} ({row.board.lock_name}):"
+    if row.state == "missing":
+        return f"{prefix} missing lock file"
+    if row.holder is None:
+        return f"{prefix} free (no lock held)"
+    age = duration(row.holder.age_seconds)
+    return f"{prefix} locked by {row.holder.user} (PID={row.holder.pid}, CMD={row.holder.command}) for {age}"
+
+
+def as_json(row: Row) -> dict[str, object]:
+    holder_data = None
+    if row.holder:
+        holder_data = {
+            "pid": row.holder.pid,
+            "user": row.holder.user,
+            "command": row.holder.command,
+            "age_seconds": row.holder.age_seconds,
+            "age": duration(row.holder.age_seconds),
+        }
 
     return {
-        "filename": filename,
-        "date": f"{month} {day}",
-        "time": time,
-        "ip_suffix": ip_suffix,
-        "time_since": time_since,
-        "time_category": time_category,
-        "username": username,
+        "ip": row.board.ip,
+        "ip_suffix": ip_suffix(row.board.ip),
+        "machine": row.board.machine,
+        "board_id": row.board.board_id,
+        "board_type": row.board.type_label,
+        "configured": row.board.configured,
+        "lock_name": row.board.lock_name,
+        "lock_path": str(row.lock_path),
+        "lock_file_exists": row.lock_file_exists,
+        "state": row.state,
+        "holder": holder_data,
     }
 
 
-def get_board_status():
-    """Get current board status by listing S2 lock files.
+def status_symbol(state: str, plain: bool) -> str:
+    return state if plain else SYMBOLS[state]
 
-    Returns:
-        List of strings from ls command output or empty list if none found.
-    """
+
+def print_rows(args: argparse.Namespace) -> None:
+    config_root = args.config_root or read_config_root()
+    locks_dir = args.locks_dir or config_root / LOCKS_DIR
+    data = rows(config_root, locks_dir, include_unconfigured=not args.config_only)
+    visible = data if args.all else [row for row in data if row.holder is not None]
+
+    if args.json:
+        print(
+            json.dumps(
+                [as_json(row) for row in visible],
+                indent=2 if args.pretty else None,
+                separators=None if args.pretty else (",", ":"),
+            )
+        )
+        return
+
+    if not args.no_header:
+        print(("Board Status" if args.all else "Locked Boards") + "\n")
+
+    if not data:
+        print(f"No boards found in {config_root / NETWORK_CONFIG} or {locks_dir}")
+        return
+    if not visible:
+        print("No locked boards.")
+        return
+
+    for row in visible:
+        if args.details:
+            print(detailed(row))
+        else:
+            print(compact(row, full_ip=args.full_ip, show_pid=args.pid, plain=args.plain))
+
+
+def parser() -> argparse.ArgumentParser:
+    cli = argparse.ArgumentParser(description="Monitor py-spinnaker2 board locks")
+    cli.add_argument("--config-root", type=Path, help="SpiNNaker config root")
+    cli.add_argument("--locks-dir", type=Path, help="lock directory")
+    cli.add_argument("--all", action="store_true", help="show free and missing boards too")
+    cli.add_argument("--config-only", action="store_true", help="hide unconfigured lock files")
+    cli.add_argument("--details", action="store_true", help="show lock file, PID, command, and age")
+    cli.add_argument("--full-ip", action="store_true", help="show full IPs")
+    cli.add_argument("--pid", action="store_true", help="show PIDs in compact output")
+    cli.add_argument("--plain", "--no-emoji", action="store_true", help="use text states instead of emoji")
+    cli.add_argument("--json", action="store_true", help="emit JSON")
+    cli.add_argument("--pretty", action="store_true", help="pretty-print JSON")
+    cli.add_argument("--no-header", action="store_true", help="omit compact/detail header")
+    return cli
+
+
+def main() -> None:
     try:
-        # Use shell=True to handle glob expansion properly
-        result = subprocess.run("ls /tmp/s2* -h -lct 2>/dev/null", shell=True, capture_output=True, text=True)
-        if result.returncode == 0 and result.stdout.strip():
-            return [line for line in result.stdout.strip().split("\n") if line.strip()]
-        else:
-            return []
-    except Exception:
-        return []
-
-
-def print_board_hoggers(lines=None):
-    """Display board status with traffic light indicators.
-
-    Shows each board's IP suffix, status (🟢🟡🟠🔴), and username if locked.
-    Format: <ip_suffix> <status_indicator> [username]
-
-    Args:
-        lines: Optional list of ls output lines. If None, fetches current status.
-    """
-    if lines is None:
-        lines = get_board_status()
-
-    # Simple functional header
-    print("Board Status")
-    print()
-
-    # Parse all lock files
-    locked_boards = {}
-    for line in lines:
-        if not line.strip() or line.startswith("total"):
-            continue
-
-        parsed = parse_ls_line(line)
-        if parsed:
-            locked_boards[parsed["ip_suffix"]] = parsed
-
-    # Get known board IPs and check status
-    known_ips = get_all_board_ips()
-
-    # Also include any 4.* boards found in lock files
-    for ip_suffix in locked_boards.keys():
-        if ip_suffix.startswith("4.") and ip_suffix not in known_ips:
-            known_ips.append(ip_suffix)
-
-    # Sort IPs for consistent display
-    known_ips.sort()
-
-    # Display each board
-    for ip_suffix in known_ips:
-        if ip_suffix in locked_boards:
-            # Board is locked
-            parsed = locked_boards[ip_suffix]
-            status = get_status_indicator(parsed["time_category"], parsed["time_since"])
-            hogger = parsed["username"]
-            print(f"{ip_suffix} {status} {hogger}")
-        else:
-            # Board is free
-            print(f"{ip_suffix} 🟢")
-
-    # Also check for any other 4.* boards in lock files that we might have missed
-    for ip_suffix, parsed in locked_boards.items():
-        if ip_suffix.startswith("4.") and ip_suffix not in known_ips:
-            status = get_status_indicator(parsed["time_category"], parsed["time_since"])
-            hogger = parsed["username"]
-            print(f"{ip_suffix} {status} {hogger}")
-
-
-def main():
-    """Main function to handle command line arguments and display board status."""
-    parser = argparse.ArgumentParser(
-        description="BoardHog: Monitor SpiNNaker2 board usage with traffic light indicators",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-    boardhog                     # Show current board status
-    watch -n .5 boardhog         # Monitor in real-time
-    
-Status indicators:
-    🟢 Free    🟡 < 1min    🟠 1-5min    🔴 > 5min
-        """,
-    )
-
-    parser.parse_args()  # Parse arguments for help functionality
-
-    try:
-        # Check if we're reading from stdin (piped input)
-        if not sys.stdin.isatty():
-            lines = [line.strip() for line in sys.stdin]
-            print_board_hoggers(lines)
-        else:
-            print_board_hoggers()
+        print_rows(parser().parse_args())
     except KeyboardInterrupt:
-        print("\nMonitoring stopped.")
+        print("\nStopped.")
     except BrokenPipeError:
-        # Handle broken pipe gracefully when piping to other commands
-        pass
+        sys.stderr.close()
 
 
 if __name__ == "__main__":
