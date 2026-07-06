@@ -14,14 +14,10 @@ Lock files are placeholders. A board is busy only while a process holds the file
 
 ## Install
 
-```bash
-python -m pip install -e ~/boardhog
-```
-
-Or keep the existing symlink:
+From this repository:
 
 ```bash
-ln -sf ~/boardhog/boardhog.py ~/.local/bin/boardhog
+python -m pip install -e .
 ```
 
 ## Usage
