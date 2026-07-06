@@ -303,19 +303,20 @@ def duration(seconds: int | None) -> str:
 
 def compact(row: Row, full_ip: bool, show_pid: bool, plain: bool) -> str:
     label = row.board.ip if full_ip else ip_suffix(row.board.ip)
+    label_width = 15 if full_ip else 5
     symbol = status_symbol(row.state, plain)
 
     if row.state == "missing":
-        return f"{label:<15} {symbol} missing {row.board.lock_name}"
+        return f"{label:<{label_width}} {symbol} missing {row.board.lock_name}"
     if row.holder is None:
-        return f"{label:<15} {symbol} {row.board.label}"
+        return f"{label:<{label_width}} {symbol} {row.board.label}"
 
     pid = f" PID={row.holder.pid}" if show_pid else ""
     age = duration(row.holder.age_seconds)
     user = f"{row.holder.user:<12}"
     age_col = f"{age:<8}"
     command = f"{row.holder.command:<10}"
-    return f"{label:<15} {symbol} {user} {age_col} {command}{pid} ({row.board.label})"
+    return f"{label:<{label_width}} {symbol} {user} {age_col} {command}{pid} ({row.board.label})"
 
 
 def detailed(row: Row) -> str:

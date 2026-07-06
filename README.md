@@ -43,7 +43,7 @@ Run `boardhog --help` for all flags.
 ```text
 Locked Boards
 
-1.11            🔴 alice 12m 04s python (frame_5)
+1.11  🔴 alice        12m 04s  python     (frame_5)
 ```
 
 ```text
