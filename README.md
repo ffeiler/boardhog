@@ -24,17 +24,31 @@ Or keep the existing symlink:
 ln -sf ~/boardhog/boardhog.py ~/.local/bin/boardhog
 ```
 
-## Use
+## Usage
+
+Common checks:
 
 ```bash
-boardhog                         # locked boards only, emoji
+boardhog                         # locked boards only
 boardhog --all                   # include free and missing boards
-boardhog --plain --no-header     # script-friendly text
-boardhog --details               # full IP, lock file, PID, command, age
-boardhog --json                  # locked boards as compact JSON
-boardhog --json --pretty         # readable JSON
-watch_locks                      # zsh alias
+boardhog --details               # lock file, PID, command, age
 ```
+
+Script output:
+
+```bash
+boardhog --plain --no-header     # text states, no title
+boardhog --json                  # compact JSON
+boardhog --json --pretty         # readable JSON
+```
+
+Live view:
+
+```bash
+watch_locks
+```
+
+Run `boardhog --help` for all flags.
 
 ## Output
 
