@@ -42,12 +42,6 @@ boardhog --json                  # compact JSON
 boardhog --json --pretty         # readable JSON
 ```
 
-Live view:
-
-```bash
-watch_locks
-```
-
 Run `boardhog --help` for all flags.
 
 ## Output
@@ -64,12 +58,6 @@ Locked Boards
 
 ```json
 [{"ip":"192.168.1.11","state":"long","holder":{"pid":"1234","user":"alice","command":"python","age_seconds":724,"age":"12m 04s"}}]
-```
-
-## Alias
-
-```zsh
-alias watch_locks='watch -n 1 -d boardhog'
 ```
 
 
