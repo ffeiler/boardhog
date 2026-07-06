@@ -52,6 +52,8 @@ Locked Boards
 alias watch_locks='watch -n 1 -d boardhog'
 ```
 
-## States
+## Status Indicators
 
-`boardhog` shows `short`, `medium`, and `long` by default. Use `--all` to include `free` and `missing`.
+🟢 `free` • 🟡 `short` (<1 min) • 🟠 `medium` (1-5 min) • 🔴 `long` (>5 min) • `?` `missing`
+
+`boardhog` shows locked boards by default. Use `--all` to include free and missing boards.
