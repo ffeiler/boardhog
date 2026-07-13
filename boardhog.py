@@ -20,6 +20,7 @@ DEFAULT_CONFIG_ROOT = Path("/mnt/spinnaker")
 NETWORK_CONFIG = "spinnaker2_network_config.yml"
 LOCKS_DIR = "locks"
 LOCK_PREFIX = "BOARD_"
+STM_PREFIX = "STM_"
 LOCK_SUFFIX = ".lock"
 
 BOARD_TYPES = {
@@ -32,6 +33,7 @@ SYMBOLS = {
     "short": "🟡",
     "medium": "🟠",
     "long": "🔴",
+    "blocked": "🚫",
     "missing": "?",
 }
 
@@ -47,13 +49,18 @@ class Board:
     board_type: str | None = None
     n_boards: int = 1
     configured: bool = True
+    stm_ip: str | None = None
+    is_stm: bool = False
 
     @property
     def lock_name(self) -> str:
-        return f"{LOCK_PREFIX}{self.ip.replace('.', '_')}{LOCK_SUFFIX}"
+        prefix = STM_PREFIX if self.is_stm else LOCK_PREFIX
+        return f"{prefix}{self.ip.replace('.', '_')}{LOCK_SUFFIX}"
 
     @property
     def label(self) -> str:
+        if self.is_stm:
+            return f"STM {self.machine}" if self.machine else "STM"
         if not self.machine:
             return "unconfigured"
         if self.n_boards > 1 and self.board_id is not None:
@@ -79,14 +86,17 @@ class Row:
     lock_path: Path
     holder: Holder | None
     lock_file_exists: bool
+    stm_holder: Holder | None = None
 
     @property
     def state(self) -> str:
         if not self.lock_file_exists:
             return "missing"
-        if self.holder is None:
-            return "free"
-        return age_state(self.holder.age_seconds)
+        if self.holder is not None:
+            return age_state(self.holder.age_seconds)
+        if self.stm_holder is not None:
+            return "blocked"
+        return "free"
 
 
 def read_config_root(pointer: Path = CONFIG_POINTER) -> Path:
@@ -127,10 +137,24 @@ def parse_network_config(path: Path) -> list[tuple[str, dict[str, str]]]:
     return machines
 
 
+def normalize_stm_ip(value: str | None) -> str | None:
+    """Config STM_IP is a literal 'None' string for single-node boards; treat as no STM."""
+    if not value or value.strip().lower() == "none":
+        return None
+    value = value.strip()
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    return value
+
+
 def configured_boards(config_root: Path) -> list[Board]:
     boards: list[Board] = []
+    stms: dict[str, Board] = {}
 
     for machine, data in parse_network_config(config_root / NETWORK_CONFIG):
+        stm_ip = normalize_stm_ip(data.get("STM_IP"))
         start_ip = data.get("ETH_IP_START")
         if not start_ip:
             continue
@@ -148,16 +172,22 @@ def configured_boards(config_root: Path) -> list[Board]:
                     board_id=board_id,
                     board_type=data.get("type"),
                     n_boards=n_boards,
+                    stm_ip=stm_ip,
                 )
             )
 
-    return boards
+        # One STM entity per frame that has an STM controller (shared by all its boards).
+        if stm_ip and stm_ip not in stms:
+            stms[stm_ip] = Board(ip=stm_ip, machine=machine, board_type="STM", is_stm=True)
+
+    return boards + list(stms.values())
 
 
 def inventory(config_root: Path, locks_dir: Path, include_unconfigured: bool) -> list[Board]:
     boards = {board.ip: board for board in configured_boards(config_root)}
 
     if include_unconfigured:
+        # ponytail: only unconfigured BOARD_ locks are surfaced; configured frames cover STMs.
         pattern = str(locks_dir / f"{LOCK_PREFIX}*{LOCK_SUFFIX}")
         for lock_file in glob.glob(pattern):
             ip = ip_from_lock_name(Path(lock_file).name)
@@ -205,6 +235,8 @@ def proc_locks(path: Path = Path("/proc/locks")) -> dict[tuple[str, str], str]:
                 continue
             match = DEV_INODE_RE.match(fields[index + 1])
             if match and field != "-1":
+                # setdefault keeps the first PID per inode: in /proc/locks the holder
+                # is listed before its "->" waiters, so this resolves to the holder.
                 locks.setdefault((match.group(1).lower(), match.group(2)), field)
             break
 
@@ -222,13 +254,20 @@ def lock_key(path: Path) -> tuple[str, str] | None:
 
 def rows(config_root: Path, locks_dir: Path, include_unconfigured: bool) -> list[Row]:
     locks = proc_locks()
-    result: list[Row] = []
 
-    for board in inventory(config_root, locks_dir, include_unconfigured):
+    def resolve(board: Board) -> tuple[Board, Path, Holder | None, bool]:
         lock_path = locks_dir / board.lock_name
         key = lock_key(lock_path)
         pid = locks.get(key) if key else None
-        result.append(Row(board, lock_path, holder(pid) if pid else None, lock_path.exists()))
+        return board, lock_path, (holder(pid) if pid else None), lock_path.exists()
+
+    resolved = [resolve(board) for board in inventory(config_root, locks_dir, include_unconfigured)]
+    stm_holders = {board.ip: held for board, _, held, _ in resolved if board.is_stm}
+
+    result: list[Row] = []
+    for board, lock_path, held, exists in resolved:
+        stm_holder = stm_holders.get(board.stm_ip) if board.stm_ip else None
+        result.append(Row(board, lock_path, held, exists, stm_holder))
 
     return result
 
@@ -301,57 +340,71 @@ def duration(seconds: int | None) -> str:
     return f"{seconds}s"
 
 
+def holder_columns(holder: Holder, show_pid: bool) -> str:
+    pid = f" PID={holder.pid}" if show_pid else ""
+    return f"{holder.user:<12} {duration(holder.age_seconds):<8} {holder.command:<10}{pid}"
+
+
 def compact(row: Row, full_ip: bool, show_pid: bool, plain: bool) -> str:
     label = row.board.ip if full_ip else ip_suffix(row.board.ip)
     label_width = 15 if full_ip else 5
     symbol = status_symbol(row.state, plain)
+    head = f"{label:<{label_width}} {symbol}"
 
     if row.state == "missing":
-        return f"{label:<{label_width}} {symbol} missing {row.board.lock_name}"
+        return f"{head} missing {row.board.lock_name}"
+    if row.state == "blocked":
+        via = f" via STM {ip_suffix(row.board.stm_ip)}"
+        return f"{head} {holder_columns(row.stm_holder, show_pid)} ({row.board.label}){via}"
     if row.holder is None:
-        return f"{label:<{label_width}} {symbol} {row.board.label}"
-
-    pid = f" PID={row.holder.pid}" if show_pid else ""
-    age = duration(row.holder.age_seconds)
-    user = f"{row.holder.user:<12}"
-    age_col = f"{age:<8}"
-    command = f"{row.holder.command:<10}"
-    return f"{label:<{label_width}} {symbol} {user} {age_col} {command}{pid} ({row.board.label})"
+        return f"{head} {row.board.label}"
+    return f"{head} {holder_columns(row.holder, show_pid)} ({row.board.label})"
 
 
 def detailed(row: Row) -> str:
     prefix = f"{row.board.ip:<15} ({row.board.lock_name}):"
     if row.state == "missing":
         return f"{prefix} missing lock file"
+    if row.state == "blocked":
+        stm = row.stm_holder
+        return (
+            f"{prefix} blocked by {stm.user} via STM {row.board.stm_ip} "
+            f"(PID={stm.pid}, CMD={stm.command}) for {duration(stm.age_seconds)}"
+        )
     if row.holder is None:
         return f"{prefix} free (no lock held)"
     age = duration(row.holder.age_seconds)
     return f"{prefix} locked by {row.holder.user} (PID={row.holder.pid}, CMD={row.holder.command}) for {age}"
 
 
-def as_json(row: Row) -> dict[str, object]:
-    holder_data = None
-    if row.holder:
-        holder_data = {
-            "pid": row.holder.pid,
-            "user": row.holder.user,
-            "command": row.holder.command,
-            "age_seconds": row.holder.age_seconds,
-            "age": duration(row.holder.age_seconds),
-        }
+def holder_json(holder: Holder | None) -> dict[str, object] | None:
+    if holder is None:
+        return None
+    return {
+        "pid": holder.pid,
+        "user": holder.user,
+        "command": holder.command,
+        "age_seconds": holder.age_seconds,
+        "age": duration(holder.age_seconds),
+    }
 
+
+def as_json(row: Row) -> dict[str, object]:
     return {
         "ip": row.board.ip,
         "ip_suffix": ip_suffix(row.board.ip),
         "machine": row.board.machine,
         "board_id": row.board.board_id,
         "board_type": row.board.type_label,
+        "is_stm": row.board.is_stm,
         "configured": row.board.configured,
         "lock_name": row.board.lock_name,
         "lock_path": str(row.lock_path),
         "lock_file_exists": row.lock_file_exists,
         "state": row.state,
-        "holder": holder_data,
+        "stm_ip": row.board.stm_ip,
+        "holder": holder_json(row.holder),
+        "stm_holder": holder_json(row.stm_holder),
     }
 
 
@@ -359,11 +412,19 @@ def status_symbol(state: str, plain: bool) -> str:
     return state if plain else SYMBOLS[state]
 
 
+def is_visible(row: Row, show_all: bool) -> bool:
+    if show_all:
+        return True
+    # Default view: only boards that are unavailable (locked or blocked). STM
+    # entities and free/missing rows appear only under --all.
+    return not row.board.is_stm and row.state not in ("free", "missing")
+
+
 def print_rows(args: argparse.Namespace) -> None:
     config_root = args.config_root or read_config_root()
     locks_dir = args.locks_dir or config_root / LOCKS_DIR
     data = rows(config_root, locks_dir, include_unconfigured=not args.config_only)
-    visible = data if args.all else [row for row in data if row.holder is not None]
+    visible = [row for row in data if is_visible(row, args.all)]
 
     if args.json:
         print(
@@ -376,13 +437,13 @@ def print_rows(args: argparse.Namespace) -> None:
         return
 
     if not args.no_header:
-        print(("Board Status" if args.all else "Locked Boards") + "\n")
+        print(("Board Status" if args.all else "Unavailable Boards") + "\n")
 
     if not data:
         print(f"No boards found in {config_root / NETWORK_CONFIG} or {locks_dir}")
         return
     if not visible:
-        print("No locked boards.")
+        print("No unavailable boards.")
         return
 
     for row in visible:
@@ -396,7 +457,7 @@ def parser() -> argparse.ArgumentParser:
     cli = argparse.ArgumentParser(description="Monitor py-spinnaker2 board locks")
     cli.add_argument("--config-root", type=Path, help="SpiNNaker config root")
     cli.add_argument("--locks-dir", type=Path, help="lock directory")
-    cli.add_argument("--all", action="store_true", help="show free and missing boards too")
+    cli.add_argument("--all", action="store_true", help="show free/missing boards and STM controllers too")
     cli.add_argument("--config-only", action="store_true", help="hide unconfigured lock files")
     cli.add_argument("--details", action="store_true", help="show lock file, PID, command, and age")
     cli.add_argument("--full-ip", action="store_true", help="show full IPs")
