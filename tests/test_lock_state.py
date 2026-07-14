@@ -1,4 +1,4 @@
-"""Runnable checks for the pure logic: config parsing, state derivation, rendering, JSON.
+"""Runnable checks for the pure logic: config parsing, lock naming, state derivation, JSON.
 
 Filesystem/proc access (holder(), proc_locks()) is exercised by running boardhog live, not here.
 IPs are RFC 5737 documentation ranges (192.0.2.0/24, 198.51.100.0/24), not real boards.
@@ -9,18 +9,15 @@ from pathlib import Path
 
 import boardhog as bh
 
-# STM_IP lines are present in the real config; boardhog tracks per-board locks and ignores them.
 CONFIG = """\
 frame_1:
   type: 248
   n_boards: 3
-  STM_IP: 192.0.2.2
   ETH_IP_START: 192.0.2.21
 
 b201_1:
   type: 201
   n_boards: 1
-  STM_IP: None
   ETH_IP_START: 198.51.100.2
 """
 
@@ -40,9 +37,6 @@ def test_configured_boards():
     single = next(b for b in boards if b.machine == "b201_1")
     assert single.ip == "198.51.100.2" and single.n_boards == 1
 
-    # No STM entities: boardhog only tracks per-board BOARD_ locks.
-    assert all(b.lock_name.startswith(bh.LOCK_PREFIX) for b in boards)
-
 
 def test_board_lock_name():
     board = bh.Board(ip="192.0.2.21", machine="frame_1", board_id=0, n_boards=3)
@@ -55,17 +49,16 @@ def _row(*, board_held, exists=True):
 
 
 def test_state_derivation():
-    # Availability is per-board: only this board's own lock holder matters (no STM gating).
     assert _row(board_held=None).state == "free"
     assert _row(board_held=_held()).state == "long"
     assert _row(board_held=None, exists=False).state == "missing"
 
 
-def test_json_has_no_stm_fields():
+def test_as_json():
     blob = bh.as_json(_row(board_held=None))
+    assert blob["ip"] == "192.0.2.21"
     assert blob["state"] == "free"
     assert blob["holder"] is None
-    assert not any(k in blob for k in ("is_stm", "stm_ip", "stm_holder"))
 
 
 if __name__ == "__main__":

@@ -82,10 +82,6 @@ class Row:
 
     @property
     def state(self) -> str:
-        # ponytail: availability is per-board only, so we track just the BOARD_<ip> lock.
-        # A frame's STM lock is deliberately NOT tracked: spinnman's lock_board() takes only
-        # the per-board flock; the STM lock gates STM ops (reset/CAN/power), not allocation, so
-        # boards under one STM co-allocate freely and STM state can't mark a board taken.
         if not self.lock_file_exists:
             return "missing"
         if self.holder is not None:
@@ -162,7 +158,6 @@ def inventory(config_root: Path, locks_dir: Path, include_unconfigured: bool) ->
     boards = {board.ip: board for board in configured_boards(config_root)}
 
     if include_unconfigured:
-        # ponytail: surface any BOARD_ lock file the config didn't already account for.
         pattern = str(locks_dir / f"{LOCK_PREFIX}*{LOCK_SUFFIX}")
         for lock_file in glob.glob(pattern):
             ip = ip_from_lock_name(Path(lock_file).name)

@@ -8,9 +8,7 @@ Board inventory comes from the SpiNNaker2 network config. `boardhog` shows unava
 
 🟢 `free` • 🟡 `short` (<1 min) • 🟠 `medium` (1-5 min) • 🔴 `long` (>5 min) • `?` `missing`
 
-`boardhog` shows locked boards by default. Use `--all` to include free and missing boards.
-
-Availability is per board: a board is unavailable only when its own `BOARD_<ip>` lock is held. A frame's STM lock does not make its sibling boards unavailable (boards under one STM co-allocate), so `boardhog` does not track it.
+`boardhog` shows locked boards by default. Use `--all` to include free and missing boards. A board is unavailable when its own `BOARD_<ip>` lock is held.
 
 ## Install
 
