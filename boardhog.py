@@ -20,7 +20,6 @@ DEFAULT_CONFIG_ROOT = Path("/mnt/spinnaker")
 NETWORK_CONFIG = "spinnaker2_network_config.yml"
 LOCKS_DIR = "locks"
 LOCK_PREFIX = "BOARD_"
-STM_PREFIX = "STM_"
 LOCK_SUFFIX = ".lock"
 
 BOARD_TYPES = {
@@ -33,7 +32,6 @@ SYMBOLS = {
     "short": "🟡",
     "medium": "🟠",
     "long": "🔴",
-    "blocked": "🚫",
     "missing": "?",
 }
 
@@ -49,18 +47,13 @@ class Board:
     board_type: str | None = None
     n_boards: int = 1
     configured: bool = True
-    stm_ip: str | None = None
-    is_stm: bool = False
 
     @property
     def lock_name(self) -> str:
-        prefix = STM_PREFIX if self.is_stm else LOCK_PREFIX
-        return f"{prefix}{self.ip.replace('.', '_')}{LOCK_SUFFIX}"
+        return f"{LOCK_PREFIX}{self.ip.replace('.', '_')}{LOCK_SUFFIX}"
 
     @property
     def label(self) -> str:
-        if self.is_stm:
-            return f"STM {self.machine}" if self.machine else "STM"
         if not self.machine:
             return "unconfigured"
         if self.n_boards > 1 and self.board_id is not None:
@@ -86,16 +79,17 @@ class Row:
     lock_path: Path
     holder: Holder | None
     lock_file_exists: bool
-    stm_holder: Holder | None = None
 
     @property
     def state(self) -> str:
+        # ponytail: availability is per-board only, so we track just the BOARD_<ip> lock.
+        # A frame's STM lock is deliberately NOT tracked: spinnman's lock_board() takes only
+        # the per-board flock; the STM lock gates STM ops (reset/CAN/power), not allocation, so
+        # boards under one STM co-allocate freely and STM state can't mark a board taken.
         if not self.lock_file_exists:
             return "missing"
         if self.holder is not None:
             return age_state(self.holder.age_seconds)
-        if self.stm_holder is not None:
-            return "blocked"
         return "free"
 
 
@@ -137,24 +131,10 @@ def parse_network_config(path: Path) -> list[tuple[str, dict[str, str]]]:
     return machines
 
 
-def normalize_stm_ip(value: str | None) -> str | None:
-    """Config STM_IP is a literal 'None' string for single-node boards; treat as no STM."""
-    if not value or value.strip().lower() == "none":
-        return None
-    value = value.strip()
-    try:
-        ipaddress.ip_address(value)
-    except ValueError:
-        return None
-    return value
-
-
 def configured_boards(config_root: Path) -> list[Board]:
     boards: list[Board] = []
-    stms: dict[str, Board] = {}
 
     for machine, data in parse_network_config(config_root / NETWORK_CONFIG):
-        stm_ip = normalize_stm_ip(data.get("STM_IP"))
         start_ip = data.get("ETH_IP_START")
         if not start_ip:
             continue
@@ -172,22 +152,17 @@ def configured_boards(config_root: Path) -> list[Board]:
                     board_id=board_id,
                     board_type=data.get("type"),
                     n_boards=n_boards,
-                    stm_ip=stm_ip,
                 )
             )
 
-        # One STM entity per frame that has an STM controller (shared by all its boards).
-        if stm_ip and stm_ip not in stms:
-            stms[stm_ip] = Board(ip=stm_ip, machine=machine, board_type="STM", is_stm=True)
-
-    return boards + list(stms.values())
+    return boards
 
 
 def inventory(config_root: Path, locks_dir: Path, include_unconfigured: bool) -> list[Board]:
     boards = {board.ip: board for board in configured_boards(config_root)}
 
     if include_unconfigured:
-        # ponytail: only unconfigured BOARD_ locks are surfaced; configured frames cover STMs.
+        # ponytail: surface any BOARD_ lock file the config didn't already account for.
         pattern = str(locks_dir / f"{LOCK_PREFIX}*{LOCK_SUFFIX}")
         for lock_file in glob.glob(pattern):
             ip = ip_from_lock_name(Path(lock_file).name)
@@ -255,21 +230,13 @@ def lock_key(path: Path) -> tuple[str, str] | None:
 def rows(config_root: Path, locks_dir: Path, include_unconfigured: bool) -> list[Row]:
     locks = proc_locks()
 
-    def resolve(board: Board) -> tuple[Board, Path, Holder | None, bool]:
+    def resolve(board: Board) -> Row:
         lock_path = locks_dir / board.lock_name
         key = lock_key(lock_path)
         pid = locks.get(key) if key else None
-        return board, lock_path, (holder(pid) if pid else None), lock_path.exists()
+        return Row(board, lock_path, holder(pid) if pid else None, lock_path.exists())
 
-    resolved = [resolve(board) for board in inventory(config_root, locks_dir, include_unconfigured)]
-    stm_holders = {board.ip: held for board, _, held, _ in resolved if board.is_stm}
-
-    result: list[Row] = []
-    for board, lock_path, held, exists in resolved:
-        stm_holder = stm_holders.get(board.stm_ip) if board.stm_ip else None
-        result.append(Row(board, lock_path, held, exists, stm_holder))
-
-    return result
+    return [resolve(board) for board in inventory(config_root, locks_dir, include_unconfigured)]
 
 
 def holder(pid: str) -> Holder:
@@ -353,9 +320,6 @@ def compact(row: Row, full_ip: bool, show_pid: bool, plain: bool) -> str:
 
     if row.state == "missing":
         return f"{head} missing {row.board.lock_name}"
-    if row.state == "blocked":
-        via = f" via STM {ip_suffix(row.board.stm_ip)}"
-        return f"{head} {holder_columns(row.stm_holder, show_pid)} ({row.board.label}){via}"
     if row.holder is None:
         return f"{head} {row.board.label}"
     return f"{head} {holder_columns(row.holder, show_pid)} ({row.board.label})"
@@ -365,12 +329,6 @@ def detailed(row: Row) -> str:
     prefix = f"{row.board.ip:<15} ({row.board.lock_name}):"
     if row.state == "missing":
         return f"{prefix} missing lock file"
-    if row.state == "blocked":
-        stm = row.stm_holder
-        return (
-            f"{prefix} blocked by {stm.user} via STM {row.board.stm_ip} "
-            f"(PID={stm.pid}, CMD={stm.command}) for {duration(stm.age_seconds)}"
-        )
     if row.holder is None:
         return f"{prefix} free (no lock held)"
     age = duration(row.holder.age_seconds)
@@ -396,15 +354,12 @@ def as_json(row: Row) -> dict[str, object]:
         "machine": row.board.machine,
         "board_id": row.board.board_id,
         "board_type": row.board.type_label,
-        "is_stm": row.board.is_stm,
         "configured": row.board.configured,
         "lock_name": row.board.lock_name,
         "lock_path": str(row.lock_path),
         "lock_file_exists": row.lock_file_exists,
         "state": row.state,
-        "stm_ip": row.board.stm_ip,
         "holder": holder_json(row.holder),
-        "stm_holder": holder_json(row.stm_holder),
     }
 
 
@@ -415,9 +370,8 @@ def status_symbol(state: str, plain: bool) -> str:
 def is_visible(row: Row, show_all: bool) -> bool:
     if show_all:
         return True
-    # Default view: only boards that are unavailable (locked or blocked). STM
-    # entities and free/missing rows appear only under --all.
-    return not row.board.is_stm and row.state not in ("free", "missing")
+    # Default view: only unavailable (locked) boards; free/missing rows appear under --all.
+    return row.state not in ("free", "missing")
 
 
 def print_rows(args: argparse.Namespace) -> None:
@@ -457,7 +411,7 @@ def parser() -> argparse.ArgumentParser:
     cli = argparse.ArgumentParser(description="Monitor py-spinnaker2 board locks")
     cli.add_argument("--config-root", type=Path, help="SpiNNaker config root")
     cli.add_argument("--locks-dir", type=Path, help="lock directory")
-    cli.add_argument("--all", action="store_true", help="show free/missing boards and STM controllers too")
+    cli.add_argument("--all", action="store_true", help="show free and missing boards too")
     cli.add_argument("--config-only", action="store_true", help="hide unconfigured lock files")
     cli.add_argument("--details", action="store_true", help="show lock file, PID, command, and age")
     cli.add_argument("--full-ip", action="store_true", help="show full IPs")
