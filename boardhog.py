@@ -118,10 +118,11 @@ def parse_network_config(path: Path) -> list[tuple[str, dict[str, str]]]:
         line = raw_line.split("#", 1)[0].rstrip()
         if not line.strip():
             continue
-        if not line.startswith((" ", "\t")) and line.endswith(":"):
+        if not line.startswith((" ", "\t")):
             if name is not None:
                 machines.append((name, data))
-            name = line[:-1].strip()
+            # A top-level "name:" opens a machine; a top-level "key: value" closes the open one and belongs to none.
+            name = line[:-1].strip() if line.endswith(":") else None
             data = {}
             continue
         if name is None or ":" not in line:
@@ -143,7 +144,8 @@ def configured_boards(config_root: Path) -> list[Board]:
             continue
         try:
             n_boards = int(data.get("n_boards", "1"))
-            first_ip = ipaddress.ip_address(start_ip)
+            # Board addresses and lock names are IPv4 across the SpiNNaker2 stack, so any other start is skipped.
+            first_ip = ipaddress.IPv4Address(start_ip)
         except ValueError:
             continue
 
@@ -168,7 +170,8 @@ def inventory(config_root: Path, locks_dir: Path, include_unconfigured: bool) ->
         pattern = str(locks_dir / f"{LOCK_PREFIX}*{LOCK_SUFFIX}")
         for lock_file in glob.glob(pattern):
             ip = ip_from_lock_name(Path(lock_file).name)
-            if ip and ip not in boards:
+            # A dangling link is no lock file: nothing can hold it, so it adds no board.
+            if ip and ip not in boards and os.path.exists(lock_file):
                 boards[ip] = Board(ip=ip, configured=False)
 
     return sorted(boards.values(), key=lambda board: ip_key(board.ip))
@@ -193,8 +196,7 @@ def ip_key(ip: str) -> tuple[int, ...]:
 
 
 def ip_suffix(ip: str) -> str:
-    parts = ip.split(".")
-    return f"{parts[2]}.{parts[3]}" if len(parts) == 4 else ip
+    return ".".join(ip.split(".")[2:])
 
 
 def proc_locks(path: Path = Path("/proc/locks")) -> dict[tuple[str, str], str]:

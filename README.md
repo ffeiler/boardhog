@@ -2,7 +2,7 @@
 
 Small CLI for py-spinnaker2 board locks.
 
-Board inventory comes from the SpiNNaker2 network config. `boardhog` shows unavailable boards by default.
+Board inventory comes from the SpiNNaker2 network config, whose `ETH_IP_START` must be IPv4, plus every `BOARD_<ip>.lock` file the config does not list; a dangling link adds no board. `boardhog` shows unavailable boards by default.
 
 ## Status Indicators
 

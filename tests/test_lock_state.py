@@ -1,7 +1,8 @@
 """Runnable checks for the pure logic: config parsing, lock naming, state derivation, compact layout, JSON, flags.
 
 Live /proc access (proc_locks(), holder() for a running pid) is exercised by running boardhog live, not here.
-IPs are RFC 5737 documentation ranges (192.0.2.0/24, 198.51.100.0/24), not real boards.
+IPs are RFC 5737 documentation ranges (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) and the RFC 3849 IPv6
+documentation prefix (2001:db8::/32), not real boards.
 """
 
 import contextlib
@@ -206,6 +207,53 @@ def test_no_bracket_unless_one_pid_holds_every_adjacent_member():
             for full_ip in (False, True):
                 lines = bh.compact_lines(data, full_ip, True, plain, GROUP)
                 assert lines == [bh.compact(row, full_ip, True, plain) for row in data], (name, lines)
+
+
+def test_top_level_scalars_belong_to_no_machine():
+    text = (
+        "SPINNAKER_CONFIG_PATH: /mnt/spinnaker\n"
+        "frame_1:\n  type: 248\n  ETH_IP_START: 192.0.2.21\n"
+        "n_boards: 3\n  type: 201\n"
+        "b201_1:\n  type: 201\n  ETH_IP_START: 198.51.100.2\n"
+    )
+    with tempfile.TemporaryDirectory() as root:
+        (Path(root) / bh.NETWORK_CONFIG).write_text(text)
+        machines = bh.parse_network_config(Path(root) / bh.NETWORK_CONFIG)
+        boards = bh.configured_boards(Path(root))
+    assert machines == [
+        ("frame_1", {"type": "248", "ETH_IP_START": "192.0.2.21"}),
+        ("b201_1", {"type": "201", "ETH_IP_START": "198.51.100.2"}),
+    ]
+    assert [(b.ip, b.board_type) for b in boards] == [("192.0.2.21", "248"), ("198.51.100.2", "201")]
+
+
+def test_an_ipv6_machine_is_skipped():
+    v6 = "v6_frame:\n  type: 248\n  n_boards: 2\n  ETH_IP_START: 2001:db8::15\n\n"
+    with tempfile.TemporaryDirectory() as root:
+        (Path(root) / bh.NETWORK_CONFIG).write_text(v6 + CONFIG)
+        boards = bh.inventory(Path(root), Path(root) / "locks", include_unconfigured=True)
+    assert [b.ip for b in boards] == ["192.0.2.21", "192.0.2.22", "192.0.2.23", "198.51.100.2"]
+
+
+def test_lock_links_dangling_and_valid():
+    with tempfile.TemporaryDirectory() as root:
+        (Path(root) / bh.NETWORK_CONFIG).write_text(CONFIG)
+        locks = Path(root) / "locks"
+        locks.mkdir()
+        for name in ("192_0_2_21", "192_0_2_22", "198_51_100_2", "203_0_113_9"):
+            (locks / f"BOARD_{name}.lock").touch()
+        (locks / "BOARD_192_0_2_23.lock").symlink_to(locks / "gone")
+        (locks / "BOARD_203_0_113_7.lock").symlink_to(locks / "gone")
+        (locks / "BOARD_203_0_113_8.lock").symlink_to(locks / "BOARD_203_0_113_9.lock")
+        states = [(row.board.ip, row.state) for row in bh.rows(Path(root), locks, include_unconfigured=True)]
+    assert states == [
+        ("192.0.2.21", "free"),
+        ("192.0.2.22", "free"),
+        ("192.0.2.23", "missing"),
+        ("198.51.100.2", "free"),
+        ("203.0.113.8", "free"),
+        ("203.0.113.9", "free"),
+    ], states
 
 
 if __name__ == "__main__":
