@@ -1,6 +1,6 @@
 """Runnable checks for the pure logic: config parsing, lock naming, state derivation, JSON.
 
-Filesystem/proc access (holder(), proc_locks()) is exercised by running boardhog live, not here.
+Live /proc access (proc_locks(), holder() for a running pid) is exercised by running boardhog live, not here.
 IPs are RFC 5737 documentation ranges (192.0.2.0/24, 198.51.100.0/24), not real boards.
 """
 
@@ -59,6 +59,13 @@ def test_as_json():
     assert blob["ip"] == "192.0.2.21"
     assert blob["state"] == "free"
     assert blob["holder"] is None
+
+
+def test_holder_unreadable_pid():
+    held = bh.holder("999999999")
+    assert held.user == "unknown"
+    assert held.command == "unknown"
+    assert held.age_seconds is None
 
 
 if __name__ == "__main__":

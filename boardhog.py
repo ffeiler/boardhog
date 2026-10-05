@@ -236,7 +236,7 @@ def rows(config_root: Path, locks_dir: Path, include_unconfigured: bool) -> list
 
 def holder(pid: str) -> Holder:
     uid = process_uid(pid)
-    user = user_from_uid(uid) if uid is not None else f"PID={pid}"
+    user = user_from_uid(uid) if uid is not None else "unknown"
     command = read_text(Path("/proc") / pid / "comm") or "unknown"
     return Holder(pid=pid, user=user, command=command, age_seconds=process_age_seconds(pid))
 
