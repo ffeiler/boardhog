@@ -56,6 +56,14 @@ Board Status
 2.23  missing frame_1[2] (no BOARD_192_0_2_23.lock)
 ```
 
+Boards cabled into one machine (`CABLED_GROUPS` in `boardhog.py`) get a bracket when one process holds them all, drawn `/`, `|`, `\` under `--plain`:
+
+```text
+2.21 ┌● alice        12m 04s    python          (frame_1[0])
+2.22 │● alice        12m 04s    python          (frame_1[1])
+2.23 └● alice        12m 04s    python          (frame_1[2])
+```
+
 `--details`:
 
 ```text

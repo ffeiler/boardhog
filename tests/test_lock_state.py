@@ -145,6 +145,69 @@ def test_no_emoji_flag_rejected():
                 raise AssertionError(f"{flag} parsed")
 
 
+GROUP = (("192.0.2.21", "192.0.2.22", "192.0.2.23"),)
+BRACKET_CHARS = {False: ("┌", "│", "└"), True: ("/", "|", "\\")}
+
+
+def _frame_row(last, holder=None, exists=True):
+    board = bh.Board(ip=f"192.0.2.{last}", machine="frame_1", board_id=last - 20, n_boards=5)
+    return bh.Row(board, Path("x"), holder, exists)
+
+
+def _pid(pid, user="someone"):
+    return bh.Holder(pid=pid, user=user, command="python", age_seconds=1576)
+
+
+def _marks(lines, full_ip):
+    return [line[15 if full_ip else 5] for line in lines]
+
+
+def test_bracket_over_a_group_one_pid_holds():
+    data = [_frame_row(20), *(_frame_row(n, _pid("999")) for n in (21, 22, 23)), _frame_row(24, _pid("999"))]
+    for show_all in (False, True):
+        visible = [row for row in data if bh.is_visible(row, show_all)]
+        for plain in (False, True):
+            for full_ip in (False, True):
+                for show_pid in (False, True):
+                    lines = bh.compact_lines(visible, full_ip, show_pid, plain, GROUP)
+                    marks = _marks(lines, full_ip)
+                    triad = marks[1:4] if show_all else marks[0:3]
+                    assert triad == list(BRACKET_CHARS[plain]), lines
+                    assert marks.count(" ") == len(marks) - 3, lines
+                    for row, line in zip(visible, lines):
+                        width = 15 if full_ip else 5
+                        bare = bh.compact(row, full_ip, show_pid, plain)
+                        assert line[:width] + " " + line[width + 1 :] == bare, (line, bare)
+                        assert line[width + 1 :].startswith(bh.status_symbol(row.state, plain)), line
+
+
+def test_bracket_counts_a_gone_holder_by_pid():
+    gone = [_pid("4194304", user="unknown"), _pid("4194304", user="unknown"), _pid("4194304")]
+    data = [_frame_row(n, h) for n, h in zip((21, 22, 23), gone)]
+    assert _marks(bh.compact_lines(data, False, False, True, GROUP), False) == ["/", "|", "\\"]
+
+
+def test_no_bracket_unless_one_pid_holds_every_adjacent_member():
+    cases = {
+        "split pids": [_frame_row(21, _pid("999")), _frame_row(22, _pid("999")), _frame_row(23, _pid("1000"))],
+        "all free": [_frame_row(21), _frame_row(22), _frame_row(23)],
+        "two of three": [_frame_row(21, _pid("999")), _frame_row(22, _pid("999"))],
+        "free member": [_frame_row(21, _pid("999")), _frame_row(22, _pid("999")), _frame_row(23)],
+        "missing member": [_frame_row(21, _pid("999")), _frame_row(22, _pid("999")), _frame_row(23, exists=False)],
+        "interleaved": [
+            _frame_row(21, _pid("999")),
+            _frame_row(24, _pid("999")),
+            _frame_row(22, _pid("999")),
+            _frame_row(23, _pid("999")),
+        ],
+    }
+    for name, data in cases.items():
+        for plain in (False, True):
+            for full_ip in (False, True):
+                lines = bh.compact_lines(data, full_ip, True, plain, GROUP)
+                assert lines == [bh.compact(row, full_ip, True, plain) for row in data], (name, lines)
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -37,6 +37,11 @@ SYMBOLS = {
 STATE_WIDTH = max(len(state) for state in SYMBOLS)
 SYMBOL_WIDTH = max(len(symbol) for symbol in SYMBOLS.values())
 
+# Boards cabled into one machine, in IP order. The network config does not mark them, so they are listed here.
+CABLED_GROUPS = (("192.168.1.21", "192.168.1.22", "192.168.1.23"),)
+# Top, middle and bottom of the bracket drawn over a cabled group held by one process, indexed by plain.
+BRACKETS = {False: ("┌", "│", "└"), True: ("/", "|", "\\")}
+
 DEV_INODE_RE = re.compile(r"^([0-9a-fA-F]+:[0-9a-fA-F]+):(\d+)$")
 PID_RE = re.compile(r"^-?\d+$")
 
@@ -310,17 +315,49 @@ def holder_columns(holder: Holder, show_pid: bool) -> str:
     return f"{holder.user:<12} {duration(holder.age_seconds):<10} {holder.command:<15}{pid}"
 
 
-def compact(row: Row, full_ip: bool, show_pid: bool, plain: bool) -> str:
+def compact(row: Row, full_ip: bool, show_pid: bool, plain: bool, mark: str = " ") -> str:
     label = row.board.ip if full_ip else ip_suffix(row.board.ip)
     label_width = 15 if full_ip else 5
     symbol_width = STATE_WIDTH if plain else SYMBOL_WIDTH
-    head = f"{label:<{label_width}} {status_symbol(row.state, plain):<{symbol_width}}"
+    head = f"{label:<{label_width}}{mark}{status_symbol(row.state, plain):<{symbol_width}}"
 
     if row.state == "missing":
         return f"{head} {row.board.label} (no {row.board.lock_name})"
     if row.holder is None:
         return f"{head} {row.board.label}"
     return f"{head} {holder_columns(row.holder, show_pid)} ({row.board.label})"
+
+
+def group_marks(visible: list[Row], plain: bool, groups: tuple[tuple[str, ...], ...] = CABLED_GROUPS) -> list[str]:
+    """Separator between label and state per row: a bracket over a group one PID holds, else a space."""
+    marks = [" "] * len(visible)
+    position = {row.board.ip: index for index, row in enumerate(visible)}
+    top, middle, bottom = BRACKETS[plain]
+    for group in groups:
+        indices = [position[ip] for ip in group if ip in position]
+        # Every member present and adjacent, so the bracket never spans a row outside the group.
+        if len(indices) != len(group) or indices != list(range(indices[0], indices[0] + len(group))):
+            continue
+        # Compare PIDs only: a holder whose process has gone reads as user "unknown" and still counts.
+        pids = {visible[index].holder.pid if visible[index].holder else None for index in indices}
+        if len(pids) != 1 or None in pids:
+            continue
+        marks[indices[0]] = top
+        for index in indices[1:-1]:
+            marks[index] = middle
+        marks[indices[-1]] = bottom
+    return marks
+
+
+def compact_lines(
+    visible: list[Row],
+    full_ip: bool,
+    show_pid: bool,
+    plain: bool,
+    groups: tuple[tuple[str, ...], ...] = CABLED_GROUPS,
+) -> list[str]:
+    marks = group_marks(visible, plain, groups)
+    return [compact(row, full_ip, show_pid, plain, mark) for row, mark in zip(visible, marks)]
 
 
 def detailed(row: Row) -> str:
@@ -398,11 +435,12 @@ def print_rows(args: argparse.Namespace) -> None:
         print("No unavailable boards.")
         return
 
-    for row in visible:
-        if args.details:
+    if args.details:
+        for row in visible:
             print(detailed(row))
-        else:
-            print(compact(row, full_ip=args.full_ip, show_pid=args.pid, plain=args.plain))
+        return
+    for line in compact_lines(visible, full_ip=args.full_ip, show_pid=args.pid, plain=args.plain):
+        print(line)
 
 
 def parser() -> argparse.ArgumentParser:
