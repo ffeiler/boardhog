@@ -28,10 +28,10 @@ BOARD_TYPES = {
 }
 
 SYMBOLS = {
-    "free": "🟢",
-    "short": "🟡",
-    "medium": "🟠",
-    "long": "🔴",
+    "free": "○",
+    "short": "●",
+    "medium": "●",
+    "long": "●",
     "missing": "?",
 }
 
@@ -411,7 +411,7 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--details", action="store_true", help="show lock file, PID, command, and age")
     cli.add_argument("--full-ip", action="store_true", help="show full IPs")
     cli.add_argument("--pid", action="store_true", help="show PIDs in compact output")
-    cli.add_argument("--plain", "--no-emoji", action="store_true", help="use text states instead of emoji")
+    cli.add_argument("--plain", "--no-emoji", action="store_true", help="use text states instead of symbols")
     cli.add_argument("--json", action="store_true", help="emit JSON")
     cli.add_argument("--pretty", action="store_true", help="pretty-print JSON")
     cli.add_argument("--no-header", action="store_true", help="omit compact/detail header")

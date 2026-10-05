@@ -68,6 +68,12 @@ def test_holder_unreadable_pid():
     assert held.age_seconds is None
 
 
+def test_status_symbols():
+    assert bh.status_symbol("free", plain=False) == "○"
+    assert all(bh.status_symbol(state, plain=False) == "●" for state in ("short", "medium", "long"))
+    assert bh.status_symbol("long", plain=True) == "long"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
