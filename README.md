@@ -6,7 +6,7 @@ Board inventory comes from the SpiNNaker2 network config. `boardhog` shows unava
 
 ## Status Indicators
 
-`●` held • `○` free • `?` missing lock file. `--plain` prints the state as text, splitting held by age into `short` (<1 min), `medium` (1-5 min) and `long` (>5 min).
+`●` held • `○` free • `?` missing lock file. `--plain` prints the state as a word padded to one width, splitting held by age into `short` (<1 min), `medium` (1-5 min) and `long` (>5 min or unknown).
 
 `boardhog` shows locked boards by default. Use `--all` to include free and missing boards. A board is unavailable when its own `BOARD_<ip>` lock is held.
 
@@ -43,7 +43,17 @@ Run `boardhog --help` for all flags.
 ```text
 Unavailable Boards
 
-2.21  ● alice        12m 04s  python     (frame_1[0])
+2.21  ● alice        12m 04s    python          (frame_1[0])
+```
+
+`--all --plain`:
+
+```text
+Board Status
+
+2.21  long    alice        12m 04s    python          (frame_1[0])
+2.22  free    frame_1[1]
+2.23  missing frame_1[2] (no BOARD_192_0_2_23.lock)
 ```
 
 `--details`:

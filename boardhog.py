@@ -34,6 +34,8 @@ SYMBOLS = {
     "long": "●",
     "missing": "?",
 }
+STATE_WIDTH = max(len(state) for state in SYMBOLS)
+SYMBOL_WIDTH = max(len(symbol) for symbol in SYMBOLS.values())
 
 DEV_INODE_RE = re.compile(r"^([0-9a-fA-F]+:[0-9a-fA-F]+):(\d+)$")
 PID_RE = re.compile(r"^-?\d+$")
@@ -303,18 +305,19 @@ def duration(seconds: int | None) -> str:
 
 
 def holder_columns(holder: Holder, show_pid: bool) -> str:
-    pid = f" PID={holder.pid}" if show_pid else ""
-    return f"{holder.user:<12} {duration(holder.age_seconds):<8} {holder.command:<10}{pid}"
+    # Widths fit an age under ten days, a full 15-character kernel comm name and a PID up to pid_max.
+    pid = f" PID={holder.pid:<7}" if show_pid else ""
+    return f"{holder.user:<12} {duration(holder.age_seconds):<10} {holder.command:<15}{pid}"
 
 
 def compact(row: Row, full_ip: bool, show_pid: bool, plain: bool) -> str:
     label = row.board.ip if full_ip else ip_suffix(row.board.ip)
     label_width = 15 if full_ip else 5
-    symbol = status_symbol(row.state, plain)
-    head = f"{label:<{label_width}} {symbol}"
+    symbol_width = STATE_WIDTH if plain else SYMBOL_WIDTH
+    head = f"{label:<{label_width}} {status_symbol(row.state, plain):<{symbol_width}}"
 
     if row.state == "missing":
-        return f"{head} missing {row.board.lock_name}"
+        return f"{head} {row.board.label} (no {row.board.lock_name})"
     if row.holder is None:
         return f"{head} {row.board.label}"
     return f"{head} {holder_columns(row.holder, show_pid)} ({row.board.label})"
@@ -411,7 +414,7 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--details", action="store_true", help="show lock file, PID, command, and age")
     cli.add_argument("--full-ip", action="store_true", help="show full IPs")
     cli.add_argument("--pid", action="store_true", help="show PIDs in compact output")
-    cli.add_argument("--plain", "--no-emoji", action="store_true", help="use text states instead of symbols")
+    cli.add_argument("--plain", action="store_true", help="print states as words: free, short, medium, long, missing")
     cli.add_argument("--json", action="store_true", help="emit JSON")
     cli.add_argument("--pretty", action="store_true", help="pretty-print JSON")
     cli.add_argument("--no-header", action="store_true", help="omit compact/detail header")
