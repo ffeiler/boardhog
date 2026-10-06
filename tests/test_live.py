@@ -8,6 +8,7 @@ import fcntl
 import io
 import os
 import pwd
+import shutil
 import signal
 import struct
 import sys
@@ -258,6 +259,23 @@ def test_one_proc_pass_serves_every_exited_holder(world, monkeypatch):
     assert (data["192.0.2.21"].pid, data["192.0.2.21"].dead_pid) == ("4321", "901")
     assert (data["192.0.2.22"].pid, data["192.0.2.22"].dead_pid) == ("4322", "902")
     assert bh.fd_holder(lock_file(world, "192_0_2_21"), exclude=set()) == "4321"
+
+
+def test_a_holder_exiting_after_the_proc_pass_still_finds_the_shell(world, monkeypatch):
+    # 901 still runs when rows() looks for exited holders and exits before its row resolves; 902 exited before.
+    add_process(world, 901, ["flock", "9"])
+    add_process(world, 4321, ["bash", "a.sh"], fds=[lock_file(world, "192_0_2_21")])
+    write_locks(world, ("192_0_2_21", 901), ("192_0_2_22", 902))
+    original = bh.lock_fds
+
+    def exit_901(paths):
+        shutil.rmtree(world.proc / "901", ignore_errors=True)
+        return original(paths)
+
+    monkeypatch.setattr(bh, "lock_fds", exit_901)
+    data = {row.board.ip: row.holder for row in bh.rows(world.root, world.locks, include_unconfigured=True)}
+    held = data["192.0.2.21"]
+    assert (held.pid, held.source, held.dead_pid, held.alive) == ("4321", "fd", "901", True)
 
 
 def test_one_frame_keys_and_draw(world):

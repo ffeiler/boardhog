@@ -355,8 +355,10 @@ def resolve_holder(
 
 def fd_holder(lock_path: Path, exclude: set[str], fds: dict[str, list[str]] | None = None) -> str | None:
     """A process whose descriptor on the lock file holds the lock, as a shell's does after its flock helper exits."""
-    found = lock_fds([lock_path]) if fds is None else fds
-    return next((pid for pid in found.get(real_path(lock_path), []) if pid not in exclude), None)
+    key = real_path(lock_path)
+    # A lock outside the refresh's pass had a live recorded holder at its scan, which has exited since; read it afresh.
+    found = fds if fds is not None and key in fds else lock_fds([lock_path])
+    return next((pid for pid in found.get(key, []) if pid not in exclude), None)
 
 
 def real_path(path: Path) -> str:
