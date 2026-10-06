@@ -62,7 +62,7 @@ HOME = "\x1b[H"
 CLEAR_LINE = "\x1b[K"
 CLEAR_BELOW = "\x1b[J"
 # Key hints: a hint whose toggle is on shows bold, the rest dim.
-LIVE_KEYS = (("a", "all"), ("d", "details"), ("q", "quit"))
+LIVE_KEYS = (("a", "all"), ("d", "details"), ("w", "waiting"), ("q", "quit"))
 CHANGE_LOG_LINES = 2
 # Header names per network-config board type; another type shows as its raw value.
 TYPE_NAMES = {"248": "spinn48", "201": "spinn1"}
@@ -71,6 +71,8 @@ TYPE_NAMES = {"248": "spinn48", "201": "spinn1"}
 CABLED_GROUPS = (("192.168.1.21", "192.168.1.22", "192.168.1.23"),)
 # Top, middle and bottom of the bracket drawn over a cabled group held by one process, indexed by plain.
 BRACKETS = {False: ("┌", "├", "└"), True: ("/", "|", "\\")}
+# The bracket on a waiter line between a group's top and bottom rows, indexed by plain.
+BRACKET_LINE = {False: "│", True: "|"}
 
 DEV_INODE_RE = re.compile(r"^([0-9a-fA-F]+:[0-9a-fA-F]+):(\d+)$")
 PID_RE = re.compile(r"^-?\d+$")
@@ -553,6 +555,16 @@ def compact(row: Row, full_ip: bool, show_pid: bool, plain: bool, mark: str = " 
     return line
 
 
+def waiter_line(
+    waiter: Holder, full_ip: bool, show_pid: bool, plain: bool, mark: str = " ", color: bool = False
+) -> str:
+    """One process waiting for a board, under its holder row: `↳` in the dot column (`waiting` in the state column
+    under --plain), the waiter's user, age and script in the holder columns, all dim; `mark` carries a bracket on."""
+    tag = "waiting" if plain else "↳"
+    cells = f"{tag:<{STATE_WIDTH if plain else SYMBOL_WIDTH}} {holder_columns(waiter, show_pid)}".rstrip()
+    return f"{'':<{15 if full_ip else 5}}{mark}{paint(cells, DIM, color)}"
+
+
 def group_marks(visible: list[Row], plain: bool, groups: tuple[tuple[str, ...], ...] = CABLED_GROUPS) -> list[str]:
     """Separator between label and state per row: a bracket over a group one PID holds, else a space."""
     marks = [" "] * len(visible)
@@ -581,9 +593,20 @@ def compact_lines(
     plain: bool,
     groups: tuple[tuple[str, ...], ...] = CABLED_GROUPS,
     color: bool = False,
+    waiters: int = 0,
 ) -> list[str]:
+    """One line per row, then up to `waiters` dim waiter lines in all, under their holder rows, the top board's first."""
     marks = group_marks(visible, plain, groups)
-    return [compact(row, full_ip, show_pid, plain, mark, color) for row, mark in zip(visible, marks)]
+    top, middle, _ = BRACKETS[plain]
+    lines: list[str] = []
+    for row, mark in zip(visible, marks):
+        lines.append(compact(row, full_ip, show_pid, plain, mark, color))
+        shown = row.waiters[: max(waiters, 0)]
+        waiters -= len(shown)
+        # Under a bracket's top or middle row the bracket runs on through the waiter lines to the next board.
+        carry = BRACKET_LINE[plain] if mark in (top, middle) else " "
+        lines += [waiter_line(waiter, full_ip, show_pid, plain, carry, color) for waiter in shown]
+    return lines
 
 
 def free_summary(visible: list[Row], full_ip: bool) -> str | None:
@@ -685,8 +708,11 @@ def sources(args: argparse.Namespace) -> tuple[Path, Path]:
     return config_root, args.locks_dir or config_root / LOCKS_DIR
 
 
-def frame_lines(args: argparse.Namespace, data: list[Row], color: bool, where: str, title: bool = True) -> list[str]:
-    """The text a static run prints, line by line; the live view takes it without the title."""
+def frame_lines(
+    args: argparse.Namespace, data: list[Row], color: bool, where: str, title: bool = True, waiters: int = 0
+) -> list[str]:
+    """The text a static run prints, line by line; the live view takes it without the title and, under its `w` key,
+    with up to `waiters` waiter lines."""
     visible = [row for row in data if is_visible(row, args.all)]
     lines: list[str] = []
     if title and not args.no_header:
@@ -702,7 +728,9 @@ def frame_lines(args: argparse.Namespace, data: list[Row], color: bool, where: s
     # Under --all the free boards fold into one summary line; --plain keeps one row per board for scripts.
     collapse = args.all and not args.plain
     listed = [row for row in visible if not (collapse and row.state == "free")]
-    lines += compact_lines(listed, full_ip=args.full_ip, show_pid=args.pid, plain=args.plain, color=color)
+    lines += compact_lines(
+        listed, full_ip=args.full_ip, show_pid=args.pid, plain=args.plain, color=color, waiters=waiters
+    )
     summary = free_summary(visible, args.full_ip) if collapse else None
     if summary:
         if listed:
@@ -749,9 +777,11 @@ def live_header(data: list[Row], now: float, color: bool) -> str:
     return "  ".join(cells)
 
 
-def live_footer(interval: float, color: bool, show_all: bool = False, details: bool = False) -> str:
+def live_footer(
+    interval: float, color: bool, show_all: bool = False, details: bool = False, waiting: bool = False
+) -> str:
     cells = [paint(f"every {interval:g}s", DIM, color)]
-    active = {"a": show_all, "d": details, "q": False}
+    active = {"a": show_all, "d": details, "w": waiting, "q": False}
     cells += [paint(f"{key} {word}", BOLD if active[key] else DIM, color) for key, word in LIVE_KEYS]
     return "  ".join(cells)
 
@@ -791,6 +821,8 @@ class LiveView:
         self.seen: dict[str, Holder | None] | None = None
         self.taken_at: dict[str, float] = {}
         self.changes: deque[str] = deque(maxlen=CHANGE_LOG_LINES)
+        # The `w` key: waiter lines under the holder rows. The live view alone has it; --details lists waiters too.
+        self.waiting = False
 
     def key(self, char: str) -> bool:
         """Apply one key press; True when it quits."""
@@ -800,6 +832,8 @@ class LiveView:
             self.args.all = not self.args.all
         elif char == "d":
             self.args.details = not self.args.details
+        elif char == "w":
+            self.waiting = not self.waiting
         return False
 
     def update(self, data: list[Row], now: float) -> None:
@@ -826,12 +860,19 @@ class LiveView:
 
     def screen(self, data: list[Row], now: float, color: bool, height: int | None = None) -> list[str]:
         """Header, rows, change log and footer, each after a blank line. Given a height, the frame fits it: the change
-        log is cut first, oldest entry first, then the rows from the bottom; the header and footer stay."""
-        body = frame_lines(self.args, data, color, self.where, title=False)
+        log is cut first, oldest entry first, then the waiter lines from the last board up, then the rows from the
+        bottom; the header and footer stay."""
+        waiters = sum(len(row.waiters) for row in data) if self.waiting else 0
+        body = frame_lines(self.args, data, color, self.where, title=False, waiters=waiters)
         log = [paint(change, DIM, color) for change in self.changes]
         if height is not None:
             # Four lines go to the header, the footer and the blank line under and over each.
             room = height - 4
+            shown = len(body) - len(frame_lines(self.args, data, color, self.where, title=False)) if waiters else 0
+            if len(body) > room and shown:
+                body = frame_lines(
+                    self.args, data, color, self.where, title=False, waiters=max(shown - (len(body) - room), 0)
+                )
             if len(body) > room:
                 body = body[: max(room, 0)]
                 while body and not body[-1]:
@@ -842,7 +883,7 @@ class LiveView:
         lines = [live_header(data, now, color), "", *body]
         if log:
             lines += ["", *log]
-        lines += ["", live_footer(self.args.watch, color, self.args.all, self.args.details)]
+        lines += ["", live_footer(self.args.watch, color, self.args.all, self.args.details, self.waiting)]
         return lines if height is None else lines[-max(height, 1) :]
 
 
@@ -938,7 +979,7 @@ def parser() -> argparse.ArgumentParser:
         "--watch",
         type=positive_seconds,
         metavar="SECS",
-        help="on a terminal, redraw every SECS seconds; keys a (--all), d (--details), q (quit)",
+        help="on a terminal, redraw every SECS seconds; keys a (--all), d (--details), w (waiters), q (quit)",
     )
     cli.add_argument(
         "--color",

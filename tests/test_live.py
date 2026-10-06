@@ -14,6 +14,7 @@ import struct
 import sys
 import termios
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -190,21 +191,25 @@ def test_key_hints_show_which_toggles_are_on():
     def bold(text):
         return bh.BOLD + text + bh.RESET
 
-    assert hints(False, False) == "  ".join([dim("a all"), dim("d details"), dim("q quit")])
-    assert hints(True, False) == "  ".join([bold("a all"), dim("d details"), dim("q quit")])
-    assert hints(True, True) == "  ".join([bold("a all"), bold("d details"), dim("q quit")])
-    assert bh.live_footer(1.0, False, True, True) == "every 1s  a all  d details  q quit"
+    assert hints(False, False) == "  ".join([dim("a all"), dim("d details"), dim("w waiting"), dim("q quit")])
+    assert hints(True, False) == "  ".join([bold("a all"), dim("d details"), dim("w waiting"), dim("q quit")])
+    assert hints(True, True) == "  ".join([bold("a all"), bold("d details"), dim("w waiting"), dim("q quit")])
+    assert bh.live_footer(1.0, True, waiting=True).endswith(bold("w waiting") + "  " + dim("q quit"))
+    assert bh.live_footer(1.0, False, True, True, True) == "every 1s  a all  d details  w waiting  q quit"
     view = bh.LiveView(bh.parser().parse_args(["-n", "1", "--details"]), "nowhere")
     assert bh.BOLD + "d details" in view.screen([], 0.0, True)[-1]
     view.key("d")
     assert bh.DIM + "d details" in view.screen([], 0.0, True)[-1]
+    assert bh.DIM + "w waiting" in view.screen([], 0.0, True)[-1]
+    view.key("w")
+    assert bh.BOLD + "w waiting" in view.screen([], 0.0, True)[-1]
 
 
 def test_a_short_window_cuts_the_change_log_then_rows_and_keeps_the_footer():
     view = bh.LiveView(bh.parser().parse_args(["-n", "1", "--all", "--plain"]), "nowhere")
     data = snapshot(b21=holder("500"), b22=holder("501"), b23=holder("502"))
     view.changes.extend(["12:00:00  2.21 taken by alice run.py", "12:00:01  2.22 taken by alice run.py"])
-    footer = "every 1s  a all  d details  q quit"
+    footer = "every 1s  a all  d details  w waiting  q quit"
     full = view.screen(data, 0.0, False)
     header, rows, changes = full[0], full[2:5], full[6:8]
     assert full == [header, "", *rows, "", *changes, "", footer]
@@ -213,6 +218,83 @@ def test_a_short_window_cuts_the_change_log_then_rows_and_keeps_the_footer():
     assert view.screen(data, 0.0, False, height=7) == [header, "", *rows, "", footer]
     assert view.screen(data, 0.0, False, height=6) == [header, "", *rows[:2], "", footer]
     for height in range(1, 12):
+        lines = view.screen(data, 0.0, False, height=height)
+        assert len(lines) <= height and lines[-1] == footer, height
+
+
+GROUP = (("192.0.2.21", "192.0.2.22", "192.0.2.23"),)
+
+
+def waited(data, **waiters):
+    """The rows of `data` with waiters added by last octet, e.g. waited(data, b21=[holder("601")])."""
+    return [replace(row, waiters=tuple(waiters.get(f"b{row.board.ip.split('.')[-1]}", ()))) for row in data]
+
+
+def test_w_folds_waiters_out_under_their_holder_row():
+    bob, carol = holder("601", user="bob", script="flock", age=156), holder("602", user="carol", script="t.sh")
+    data = waited(snapshot(b21=holder("500"), b23=holder("600", user="dave")), b21=[bob, carol], b23=[bob])
+    view = bh.LiveView(bh.parser().parse_args(["-n", "1"]), "nowhere")
+    folded = view.screen(data, 0.0, False)
+    assert [line.split()[0] for line in folded[2:-2]] == ["2.21", "2.23"]
+    assert folded[2].endswith("+2 waiting") and folded[3].endswith("+1 waiting")
+    assert not view.key("w")
+    lines = view.screen(data, 0.0, False)[2:-2]
+    assert lines[1:3] == [
+        "      ↳ bob          2m 36s     flock",
+        "      ↳ carol        1m 00s     t.sh",
+    ]
+    assert [line.split()[0] for line in lines] == ["2.21", "↳", "↳", "2.23", "↳"]
+    assert view.screen(data, 0.0, True)[3] == "      " + bh.DIM + "↳ bob          2m 36s     flock" + bh.RESET
+    view.key("d")
+    assert not any("↳" in line for line in view.screen(data, 0.0, False))
+
+
+def test_waiter_lines_line_up_under_the_holder_columns():
+    data = waited(
+        snapshot(b21=holder("500"), b22=holder("500"), b23=holder("500")),
+        b21=[holder("601", user="bob", script="flock", age=156)],
+        b22=[holder("4194304", user="carol", script="t.sh", age=9)],
+        b23=[holder("603", user="erin", script="x.py", age=5)],
+    )
+    expected = {"bob": ("2m 36s", "flock"), "carol": ("9s", "t.sh"), "erin": ("5s", "x.py")}
+    for full_ip in (False, True):
+        for show_pid in (False, True):
+            for plain in (False, True):
+                lines = bh.compact_lines(data, full_ip, show_pid, plain, GROUP, waiters=9)
+                r21, w21, r22, w22, r23, w23 = lines
+                mark, tag = 15 if full_ip else 5, "waiting" if plain else "↳"
+                # The bracket runs on through the waiter lines between its top and bottom rows.
+                top, middle, bottom = bh.BRACKETS[plain]
+                carry = bh.BRACKET_LINE[plain]
+                assert [line[mark] for line in lines] == [top, carry, middle, carry, bottom, " "], lines
+                for row, line, user in ((r21, w21, "bob"), (r22, w22, "carol"), (r23, w23, "erin")):
+                    columns = [row.index(cell) for cell in ("alice", "1m 00s", "run.py")]
+                    assert [line.index(cell) for cell in (user, *expected[user])] == columns, (row, line)
+                    assert line.index(tag) == mark + 1 and line[:mark].strip() == ""
+                    assert line.find("PID=") == row.find("PID=")
+
+
+def test_a_short_window_folds_waiters_back_before_rows():
+    data = waited(
+        snapshot(b21=holder("500"), b22=holder("501"), b23=holder("502")),
+        b21=[holder("601", user="bob"), holder("602", user="carol")],
+        b22=[holder("603", user="erin")],
+    )
+    view = bh.LiveView(bh.parser().parse_args(["-n", "1", "--plain"]), "nowhere")
+    view.key("w")
+    view.changes.append("12:00:00  2.23 taken by alice run.py")
+    full = view.screen(data, 0.0, False)
+    header, footer = full[0], full[-1]
+    r21, w1, w2, r22, w3, r23 = full[2:8]
+    names = ["2.21", "bob", "carol", "2.22", "erin", "2.23"]
+    assert [r21[:4], w1.split()[1], w2.split()[1], r22[:4], w3.split()[1], r23[:4]] == names
+    assert full == [header, "", r21, w1, w2, r22, w3, r23, "", full[9], "", footer]
+    assert view.screen(data, 0.0, False, height=10) == [header, "", r21, w1, w2, r22, w3, r23, "", footer]
+    assert view.screen(data, 0.0, False, height=9) == [header, "", r21, w1, w2, r22, r23, "", footer]
+    assert view.screen(data, 0.0, False, height=8) == [header, "", r21, w1, r22, r23, "", footer]
+    assert view.screen(data, 0.0, False, height=7) == [header, "", r21, r22, r23, "", footer]
+    assert view.screen(data, 0.0, False, height=6) == [header, "", r21, r22, "", footer]
+    for height in range(1, 14):
         lines = view.screen(data, 0.0, False, height=height)
         assert len(lines) <= height and lines[-1] == footer, height
 
@@ -305,7 +387,7 @@ def test_one_frame_keys_and_draw(world):
     lines = view.screen(data, now, False)
     assert lines[0] == f"boardhog  {clock(now)}  spinn48 2/3 free  spinn1 1/1 free"
     assert lines[1] == "" and [line.split()[0] for line in lines[2:-2]] == ["2.22"]
-    assert lines[-2:] == ["", "every 60s  a all  d details  q quit"]
+    assert lines[-2:] == ["", "every 60s  a all  d details  w waiting  q quit"]
     assert not view.key("a") and view.screen(data, now, False)[-3] == "free  2.21 2.23 100.2"
     assert not view.key("d") and view.screen(data, now, False)[2].startswith(
         "192.0.2.21      (BOARD_192_0_2_21.lock): free"
