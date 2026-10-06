@@ -171,17 +171,17 @@ def test_header_counts_free_boards_per_type():
     data.append(bh.Row(bh.Board(ip="203.0.113.9", configured=False), Path("x"), None, True))
     assert bh.type_counts(data) == [("spinn48", 1, 3), ("spinn1", 1, 2)]
     now = time.time()
-    assert bh.live_header(data, now, 1.0, False) == (
-        f"boardhog  {clock(now)}  spinn48 1/3 free  spinn1 1/2 free  every 1s  a all  d details  q quit"
+    assert bh.live_header(data, now, False) == f"boardhog  {clock(now)}  spinn48 1/3 free  spinn1 1/2 free"
+    styled = bh.live_header(data, now, True)
+    assert styled == bh.BOLD + "boardhog" + bh.RESET + "  " + bh.DIM + clock(now) + bh.RESET + (
+        "  spinn48 1/3 free  spinn1 1/2 free"
     )
-    styled = bh.live_header(data, now, 0.5, True)
-    assert styled.startswith(bh.BOLD + "boardhog" + bh.RESET + "  " + bh.DIM + clock(now) + bh.RESET)
-    assert bh.DIM + "every 0.5s" + bh.RESET in styled
+    assert bh.live_footer(0.5, True).startswith(bh.DIM + "every 0.5s" + bh.RESET + "  ")
 
 
 def test_key_hints_show_which_toggles_are_on():
     def hints(show_all, details):
-        styled = bh.live_header([], 0.0, 1.0, True, show_all, details)
+        styled = bh.live_footer(1.0, True, show_all, details)
         return styled.split(bh.DIM + "every 1s" + bh.RESET + "  ", 1)[1]
 
     def dim(text):
@@ -193,11 +193,28 @@ def test_key_hints_show_which_toggles_are_on():
     assert hints(False, False) == "  ".join([dim("a all"), dim("d details"), dim("q quit")])
     assert hints(True, False) == "  ".join([bold("a all"), dim("d details"), dim("q quit")])
     assert hints(True, True) == "  ".join([bold("a all"), bold("d details"), dim("q quit")])
-    assert bh.live_header([], 0.0, 1.0, False, True, True).endswith("every 1s  a all  d details  q quit")
+    assert bh.live_footer(1.0, False, True, True) == "every 1s  a all  d details  q quit"
     view = bh.LiveView(bh.parser().parse_args(["-n", "1", "--details"]), "nowhere")
-    assert bh.BOLD + "d details" in view.screen([], 0.0, True)[0]
+    assert bh.BOLD + "d details" in view.screen([], 0.0, True)[-1]
     view.key("d")
-    assert bh.DIM + "d details" in view.screen([], 0.0, True)[0]
+    assert bh.DIM + "d details" in view.screen([], 0.0, True)[-1]
+
+
+def test_a_short_window_cuts_the_change_log_then_rows_and_keeps_the_footer():
+    view = bh.LiveView(bh.parser().parse_args(["-n", "1", "--all", "--plain"]), "nowhere")
+    data = snapshot(b21=holder("500"), b22=holder("501"), b23=holder("502"))
+    view.changes.extend(["12:00:00  2.21 taken by alice run.py", "12:00:01  2.22 taken by alice run.py"])
+    footer = "every 1s  a all  d details  q quit"
+    full = view.screen(data, 0.0, False)
+    header, rows, changes = full[0], full[2:5], full[6:8]
+    assert full == [header, "", *rows, "", *changes, "", footer]
+    assert view.screen(data, 0.0, False, height=24) == full
+    assert view.screen(data, 0.0, False, height=9) == [header, "", *rows, "", changes[1], "", footer]
+    assert view.screen(data, 0.0, False, height=7) == [header, "", *rows, "", footer]
+    assert view.screen(data, 0.0, False, height=6) == [header, "", *rows[:2], "", footer]
+    for height in range(1, 12):
+        lines = view.screen(data, 0.0, False, height=height)
+        assert len(lines) <= height and lines[-1] == footer, height
 
 
 def test_change_log_notes_taken_freed_and_exited():
@@ -286,9 +303,10 @@ def test_one_frame_keys_and_draw(world):
     now = time.time()
     view.update(data, now)
     lines = view.screen(data, now, False)
-    assert lines[0] == f"boardhog  {clock(now)}  spinn48 2/3 free  spinn1 1/1 free  every 60s  a all  d details  q quit"
-    assert lines[1] == "" and [line.split()[0] for line in lines[2:]] == ["2.22"]
-    assert not view.key("a") and view.screen(data, now, False)[-1] == "free  2.21 2.23 100.2"
+    assert lines[0] == f"boardhog  {clock(now)}  spinn48 2/3 free  spinn1 1/1 free"
+    assert lines[1] == "" and [line.split()[0] for line in lines[2:-2]] == ["2.22"]
+    assert lines[-2:] == ["", "every 60s  a all  d details  q quit"]
+    assert not view.key("a") and view.screen(data, now, False)[-3] == "free  2.21 2.23 100.2"
     assert not view.key("d") and view.screen(data, now, False)[2].startswith(
         "192.0.2.21      (BOARD_192_0_2_21.lock): free"
     )
@@ -325,7 +343,8 @@ def test_live_loop_reads_keys_and_restores_the_terminal(world, terminal, monkeyp
     assert len(frames) == 2
     # stdout is a terminal, so the frames are styled.
     summary = bh.DIM + "free  2.21 2.23 100.2" + bh.RESET
-    assert summary not in frames[0] and frames[1][-1] == summary
+    assert summary not in frames[0] and frames[1][-3] == summary
+    assert frames[1][-1].startswith(bh.DIM + "every 60s" + bh.RESET)
     assert frames[0][0].startswith(bh.BOLD + "boardhog" + bh.RESET)
     assert screen.getvalue().startswith(bh.ENTER_SCREEN + bh.HOME) and screen.getvalue().endswith(bh.LEAVE_SCREEN)
     assert termios.tcgetattr(terminal.stdin.fileno()) == terminal.saved

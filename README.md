@@ -36,10 +36,10 @@ On a terminal the title is bold, frame labels and notes are dim, and one accent,
 
 ## Live view
 
-`boardhog -n 1` (or `--watch 1`) redraws every second in place on the terminal's alternate screen, with the same rows as a static run under one header line. Keys: `a` toggles `--all`, `d` toggles `--details`, `q` quits, and the hint of a toggle that is on shows bold; Ctrl+C exits with 130 and SIGTERM with 143, and each restores the terminal. Without a terminal on stdout, `-n` prints one static frame and exits; `--json` ignores it.
+`boardhog -n 1` (or `--watch 1`) redraws every second in place on the terminal's alternate screen, with the same rows as a static run between a header line and a footer line. Keys: `a` toggles `--all`, `d` toggles `--details`, `q` quits, and the hint of a toggle that is on shows bold; Ctrl+C exits with 130 and SIGTERM with 143, and each restores the terminal. Without a terminal on stdout, `-n` prints one static frame and exits; `--json` ignores it.
 
 ```text
-boardhog  14:14:42  spinn48 5/10 free  spinn1 12/12 free  every 1s  a all  d details  q quit
+boardhog  14:14:42  spinn48 5/10 free  spinn1 12/12 free
 
 2.5   ● carol        11m 01s    hw_full.py      (frame_2)  +1 waiting
 2.21  ● dave         10m 04s    run_tree.py     (frame_1[0])
@@ -49,9 +49,11 @@ boardhog  14:14:42  spinn48 5/10 free  spinn1 12/12 free  every 1s  a all  d det
 
 14:14:40  2.24 freed (alice pytest, held 42m 10s)
 14:14:41  2.29 taken by bob run_tier.sh
+
+every 1s  a all  d details  q quit
 ```
 
-The header counts free boards out of all boards per network-config `type` (`248` reads `spinn48`, `201` reads `spinn1`); a board whose holder exited counts as taken, one without a lock file as not free. Under the rows, dim, are the last two changes the view saw: a board taken, freed (with how long it was held), handed over between two refreshes (one line, `2.21 alice pytest -> bob run_tier.sh (held 42m 10s)`), or its holder exited. A hold already running when the view starts dates from its process's start, as the age column does. The log lives only while the view runs. Lines past the terminal's height are cut, the change log first, and long lines are clipped at its width.
+The header names the time of the last redraw and counts free boards out of all boards per network-config `type` (`248` reads `spinn48`, `201` reads `spinn1`); a board whose holder exited counts as taken, one without a lock file as not free. Under the rows, dim, are the last two changes the view saw: a board taken, freed (with how long it was held), handed over between two refreshes (one line, `2.21 alice pytest -> bob run_tier.sh (held 42m 10s)`), or its holder exited. A hold already running when the view starts dates from its process's start, as the age column does. The log lives only while the view runs. The footer names the refresh interval and the keys. When the terminal is too short, the change log is cut first, then the rows from the bottom, and the header and footer stay; long lines are clipped at its width.
 
 ## Install
 

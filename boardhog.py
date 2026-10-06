@@ -743,12 +743,14 @@ def type_counts(data: list[Row]) -> list[tuple[str, int, int]]:
     return [(name, free, total) for name, (free, total) in counts.items()]
 
 
-def live_header(
-    data: list[Row], now: float, interval: float, color: bool, show_all: bool = False, details: bool = False
-) -> str:
+def live_header(data: list[Row], now: float, color: bool) -> str:
     cells = [paint("boardhog", BOLD, color), paint(time.strftime("%H:%M:%S", time.localtime(now)), DIM, color)]
     cells += [f"{name} {free}/{total} free" for name, free, total in type_counts(data)]
-    cells.append(paint(f"every {interval:g}s", DIM, color))
+    return "  ".join(cells)
+
+
+def live_footer(interval: float, color: bool, show_all: bool = False, details: bool = False) -> str:
+    cells = [paint(f"every {interval:g}s", DIM, color)]
     active = {"a": show_all, "d": details, "q": False}
     cells += [paint(f"{key} {word}", BOLD if active[key] else DIM, color) for key, word in LIVE_KEYS]
     return "  ".join(cells)
@@ -822,12 +824,26 @@ class LiveView:
                 self.taken_at[ip] = now
         self.seen = current
 
-    def screen(self, data: list[Row], now: float, color: bool) -> list[str]:
-        lines = [live_header(data, now, self.args.watch, color, self.args.all, self.args.details), ""]
-        lines += frame_lines(self.args, data, color, self.where, title=False)
-        if self.changes:
-            lines += ["", *(paint(change, DIM, color) for change in self.changes)]
-        return lines
+    def screen(self, data: list[Row], now: float, color: bool, height: int | None = None) -> list[str]:
+        """Header, rows, change log and footer, each after a blank line. Given a height, the frame fits it: the change
+        log is cut first, oldest entry first, then the rows from the bottom; the header and footer stay."""
+        body = frame_lines(self.args, data, color, self.where, title=False)
+        log = [paint(change, DIM, color) for change in self.changes]
+        if height is not None:
+            # Four lines go to the header, the footer and the blank line under and over each.
+            room = height - 4
+            if len(body) > room:
+                body = body[: max(room, 0)]
+                while body and not body[-1]:
+                    body.pop()
+            # The log needs a blank line above it as well.
+            keep = min(max(room - len(body) - 1, 0), len(log))
+            log = log[len(log) - keep :]
+        lines = [live_header(data, now, color), "", *body]
+        if log:
+            lines += ["", *log]
+        lines += ["", live_footer(self.args.watch, color, self.args.all, self.args.details)]
+        return lines if height is None else lines[-max(height, 1) :]
 
 
 def terminal_lines(stream) -> int:
@@ -840,7 +856,7 @@ def terminal_lines(stream) -> int:
 
 def draw(stream, lines: list[str], height: int) -> None:
     """Overwrite the screen in place: home, each line cleared to its end, then everything below cleared, so nothing
-    flickers. Lines past the terminal's height are cut, the change log first."""
+    flickers. Lines past the terminal's height are cut; LiveView.screen already fits the frame to it."""
     shown = lines[: max(height, 1)]
     stream.write(HOME + (CLEAR_LINE + "\n").join(shown) + CLEAR_LINE + CLEAR_BELOW)
     stream.flush()
@@ -873,7 +889,8 @@ def run_live(args: argparse.Namespace, stdin=None, stdout=None) -> int:
                 data = rows(config_root, locks_dir, include_unconfigured=not args.config_only)
                 view.update(data, time.time())
                 due = time.monotonic() + args.watch
-            draw(stdout, view.screen(data, time.time(), color), terminal_lines(stdout))
+            height = terminal_lines(stdout)
+            draw(stdout, view.screen(data, time.time(), color, height), height)
             wait = max(due - time.monotonic(), 0.0)
             if fd is None:
                 time.sleep(wait)
