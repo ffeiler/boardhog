@@ -7,11 +7,17 @@ import argparse
 import glob
 import ipaddress
 import json
+import math
 import os
 import pwd
 import re
+import select
+import signal
 import sys
+import termios
 import time
+import tty
+from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -48,10 +54,23 @@ DIM = "\x1b[2m"
 ACCENT = "\x1b[1;38;2;228;98;18m"
 RESET = "\x1b[0m"
 
+# Live view: the alternate screen with the cursor hidden and line wrap off, so a long line is clipped instead of
+# scrolling the frame. LEAVE_SCREEN undoes each in reverse.
+ENTER_SCREEN = "\x1b[?1049h\x1b[?25l\x1b[?7l"
+LEAVE_SCREEN = "\x1b[?7h\x1b[?25h\x1b[?1049l"
+HOME = "\x1b[H"
+CLEAR_LINE = "\x1b[K"
+CLEAR_BELOW = "\x1b[J"
+# Key hints: a hint whose toggle is on shows bold, the rest dim.
+LIVE_KEYS = (("a", "all"), ("d", "details"), ("q", "quit"))
+CHANGE_LOG_LINES = 2
+# Header names per network-config board type; another type shows as its raw value.
+TYPE_NAMES = {"248": "spinn48", "201": "spinn1"}
+
 # Boards cabled into one machine, in IP order. The network config does not mark them, so they are listed here.
 CABLED_GROUPS = (("192.168.1.21", "192.168.1.22", "192.168.1.23"),)
 # Top, middle and bottom of the bracket drawn over a cabled group held by one process, indexed by plain.
-BRACKETS = {False: ("┌", "│", "└"), True: ("/", "|", "\\")}
+BRACKETS = {False: ("┌", "├", "└"), True: ("/", "|", "\\")}
 
 DEV_INODE_RE = re.compile(r"^([0-9a-fA-F]+:[0-9a-fA-F]+):(\d+)$")
 PID_RE = re.compile(r"^-?\d+$")
@@ -281,32 +300,45 @@ def boot_time() -> float | None:
 def rows(config_root: Path, locks_dir: Path, include_unconfigured: bool) -> list[Row]:
     locks = proc_locks()
     boot = boot_time()
+    boards = inventory(config_root, locks_dir, include_unconfigured)
+    entries: dict[str, LockPids | None] = {}
+    for board in boards:
+        key = lock_key(locks_dir / board.lock_name)
+        entries[board.ip] = locks.get(key) if key else None
+    # One pass over /proc serves every lock whose recorded holders have all exited.
+    orphaned = [
+        locks_dir / board.lock_name
+        for board in boards
+        if (entry := entries[board.ip]) and entry.holders and not any((PROC / pid).is_dir() for pid in entry.holders)
+    ]
+    fds = lock_fds(orphaned) if orphaned else {}
 
     def resolve(board: Board) -> Row:
         lock_path = locks_dir / board.lock_name
-        key = lock_key(lock_path)
-        entry = locks.get(key) if key else None
+        entry = entries[board.ip]
         mtime = lock_mtime(lock_path)
         # Only a truncating open, such as a shell's `exec 9>FILE`, moves the mtime, so one from before boot says nothing.
         opened_at = mtime if mtime is not None and boot is not None and mtime > boot else None
-        held = resolve_holder(entry, lock_path, opened_at) if entry else None
+        held = resolve_holder(entry, lock_path, opened_at, fds) if entry else None
         waiters = tuple(holder(pid) for pid in entry.waiters) if entry else ()
         return Row(board, lock_path, held, lock_path.exists(), waiters, mtime)
 
-    return [resolve(board) for board in inventory(config_root, locks_dir, include_unconfigured)]
+    return [resolve(board) for board in boards]
 
 
-def resolve_holder(entry: LockPids, lock_path: Path, opened_at: float | None) -> Holder | None:
+def resolve_holder(
+    entry: LockPids, lock_path: Path, opened_at: float | None, fds: dict[str, list[str]] | None = None
+) -> Holder | None:
     """The lock's holder: a recorded PID still running, else the reader's own process with the lock file open, else
     the first recorded PID marked exited. Another user's descriptors are unreadable, so only the reader's own
-    processes can stand in for a PID that exited."""
+    processes can stand in for a PID that exited. `fds` is a lock_fds() result already read for this refresh."""
     if not entry.holders:
         return None
     for pid in entry.holders:
         if (PROC / pid).is_dir():
             return holder(pid)
     dead = entry.holders[0]
-    owner = fd_holder(lock_path, exclude=set(entry.waiters))
+    owner = fd_holder(lock_path, exclude=set(entry.waiters), fds=fds)
     if owner is not None:
         return replace(holder(owner), source="fd", dead_pid=dead)
     return Holder(
@@ -321,25 +353,37 @@ def resolve_holder(entry: LockPids, lock_path: Path, opened_at: float | None) ->
     )
 
 
-def fd_holder(lock_path: Path, exclude: set[str]) -> str | None:
-    """A process whose descriptor on the lock file holds the lock, as a shell's does after its flock helper exits.
+def fd_holder(lock_path: Path, exclude: set[str], fds: dict[str, list[str]] | None = None) -> str | None:
+    """A process whose descriptor on the lock file holds the lock, as a shell's does after its flock helper exits."""
+    found = lock_fds([lock_path]) if fds is None else fds
+    return next((pid for pid in found.get(real_path(lock_path), []) if pid not in exclude), None)
+
+
+def real_path(path: Path) -> str:
+    try:
+        return str(path.resolve())
+    except (OSError, RuntimeError):
+        return str(path)
+
+
+def lock_fds(lock_paths: list[Path]) -> dict[str, list[str]]:
+    """The PIDs whose descriptor holds the lock on each file, keyed by real path, from one pass over /proc.
 
     Waiters and their shells also have the file open, but their fdinfo lists no granted lock."""
+    found: dict[str, list[str]] = {real_path(path): [] for path in lock_paths}
     try:
-        target = str(lock_path.resolve())
         entries = sorted((entry for entry in PROC.iterdir() if entry.name.isdigit()), key=lambda e: int(e.name))
     except OSError:
-        return None
+        return found
     for entry in entries:
-        if entry.name in exclude:
-            continue
         try:
             for fd in (entry / "fd").iterdir():
-                if os.readlink(fd) == target and holds_lock(entry / "fdinfo" / fd.name):
-                    return entry.name
+                target = os.readlink(fd)
+                if target in found and entry.name not in found[target] and holds_lock(entry / "fdinfo" / fd.name):
+                    found[target].append(entry.name)
         except OSError:
             continue
-    return None
+    return found
 
 
 def holds_lock(fdinfo: Path) -> bool:
@@ -472,10 +516,18 @@ def paint(text: str, style: str, color: bool) -> str:
     return f"{style}{text}{RESET}" if color and text else text
 
 
-def use_color(plain: bool, stream=None) -> bool:
-    """Styles only on a terminal, and never under --plain or a non-empty NO_COLOR."""
-    stream = stream or sys.stdout
-    return not plain and not os.environ.get("NO_COLOR") and stream.isatty()
+def use_color(plain: bool, stream=None, mode: str = "auto") -> bool:
+    """Whether to style: never under --plain; else --color always or never; else a non-empty NO_COLOR turns styles off,
+    a non-empty FORCE_COLOR turns them on, and otherwise only a terminal gets them."""
+    if plain or mode == "never":
+        return False
+    if mode == "always":
+        return True
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    return (stream or sys.stdout).isatty()
 
 
 def compact(row: Row, full_ip: bool, show_pid: bool, plain: bool, mark: str = " ", color: bool = False) -> str:
@@ -626,13 +678,43 @@ def is_visible(row: Row, show_all: bool) -> bool:
     return row.state not in ("free", "missing")
 
 
-def print_rows(args: argparse.Namespace) -> None:
+def sources(args: argparse.Namespace) -> tuple[Path, Path]:
     config_root = args.config_root or read_config_root()
-    locks_dir = args.locks_dir or config_root / LOCKS_DIR
-    data = rows(config_root, locks_dir, include_unconfigured=not args.config_only)
+    return config_root, args.locks_dir or config_root / LOCKS_DIR
+
+
+def frame_lines(args: argparse.Namespace, data: list[Row], color: bool, where: str, title: bool = True) -> list[str]:
+    """The text a static run prints, line by line; the live view takes it without the title."""
     visible = [row for row in data if is_visible(row, args.all)]
+    lines: list[str] = []
+    if title and not args.no_header:
+        lines += [paint("Board Status" if args.all else "Unavailable Boards", BOLD, color), ""]
+
+    if not data:
+        return lines + [f"No boards found in {where}"]
+    if not visible:
+        return lines + ["No unavailable boards."]
+
+    if args.details:
+        return lines + [line for row in visible for line in detailed(row).split("\n")]
+    # Under --all the free boards fold into one summary line; --plain keeps one row per board for scripts.
+    collapse = args.all and not args.plain
+    listed = [row for row in visible if not (collapse and row.state == "free")]
+    lines += compact_lines(listed, full_ip=args.full_ip, show_pid=args.pid, plain=args.plain, color=color)
+    summary = free_summary(visible, args.full_ip) if collapse else None
+    if summary:
+        if listed:
+            lines.append("")
+        lines.append(paint(summary, DIM, color))
+    return lines
+
+
+def print_rows(args: argparse.Namespace) -> None:
+    config_root, locks_dir = sources(args)
+    data = rows(config_root, locks_dir, include_unconfigured=not args.config_only)
 
     if args.json:
+        visible = [row for row in data if is_visible(row, args.all)]
         print(
             json.dumps(
                 [as_json(row) for row in visible],
@@ -642,31 +724,181 @@ def print_rows(args: argparse.Namespace) -> None:
         )
         return
 
-    color = use_color(args.plain)
-    if not args.no_header:
-        print(paint("Board Status" if args.all else "Unavailable Boards", BOLD, color) + "\n")
+    color = use_color(args.plain, mode=args.color)
+    print("\n".join(frame_lines(args, data, color, f"{config_root / NETWORK_CONFIG} or {locks_dir}")))
 
-    if not data:
-        print(f"No boards found in {config_root / NETWORK_CONFIG} or {locks_dir}")
-        return
-    if not visible:
-        print("No unavailable boards.")
-        return
 
-    if args.details:
-        for row in visible:
-            print(detailed(row))
-        return
-    # Under --all the free boards fold into one summary line; --plain keeps one row per board for scripts.
-    collapse = args.all and not args.plain
-    listed = [row for row in visible if not (collapse and row.state == "free")]
-    for line in compact_lines(listed, full_ip=args.full_ip, show_pid=args.pid, plain=args.plain, color=color):
-        print(line)
-    summary = free_summary(visible, args.full_ip) if collapse else None
-    if summary:
-        if listed:
-            print()
-        print(paint(summary, DIM, color))
+def type_counts(data: list[Row]) -> list[tuple[str, int, int]]:
+    """Free and total boards per board type, in board order. A board whose holder exited counts as taken, a board
+    without a lock file as not free, and a board without a type is left out."""
+    counts: dict[str, list[int]] = {}
+    for row in data:
+        if not row.board.board_type:
+            continue
+        tally = counts.setdefault(TYPE_NAMES.get(str(row.board.board_type), str(row.board.board_type)), [0, 0])
+        tally[0] += row.state == "free"
+        tally[1] += 1
+    return [(name, free, total) for name, (free, total) in counts.items()]
+
+
+def live_header(
+    data: list[Row], now: float, interval: float, color: bool, show_all: bool = False, details: bool = False
+) -> str:
+    cells = [paint("boardhog", BOLD, color), paint(time.strftime("%H:%M:%S", time.localtime(now)), DIM, color)]
+    cells += [f"{name} {free}/{total} free" for name, free, total in type_counts(data)]
+    cells.append(paint(f"every {interval:g}s", DIM, color))
+    active = {"a": show_all, "d": details, "q": False}
+    cells += [paint(f"{key} {word}", BOLD if active[key] else DIM, color) for key, word in LIVE_KEYS]
+    return "  ".join(cells)
+
+
+def holder_key(held: Holder | None) -> str | None:
+    """The PID /proc/locks records for a holder, so finding the reader's own shell behind an exited PID is no change."""
+    return None if held is None else held.dead_pid or held.pid
+
+
+def change_note(label: str, before: Holder | None, after: Holder | None, held_for: int | None) -> str | None:
+    """One change-log entry for a board between two refreshes, or None when its holder did not change."""
+    if holder_key(before) == holder_key(after):
+        if before is not None and after is not None and before.alive and not after.alive:
+            return f"{label} holder pid {after.dead_pid} exited ({before.user} {display_command(before)})"
+        return None
+    if after is None:
+        return f"{label} freed ({who_holds(before)}, held {duration(held_for)})"
+    if before is not None:
+        # A handover between two refreshes: one line naming both holders and how long the first held the board.
+        return f"{label} {who_holds(before)} -> {who_holds(after)} (held {duration(held_for)})"
+    if after.alive:
+        return f"{label} taken by {after.user} {display_command(after)}"
+    return f"{label} taken, holder pid {after.dead_pid} exited"
+
+
+def who_holds(held: Holder) -> str:
+    return f"{held.user} {display_command(held)}" if held.alive else f"pid {held.dead_pid}"
+
+
+class LiveView:
+    """What the live view keeps between refreshes: the flags its keys toggle, the holders it last saw, when each hold
+    began, and the last changes. It lives in memory only while the view runs."""
+
+    def __init__(self, args: argparse.Namespace, where: str) -> None:
+        self.args = argparse.Namespace(**vars(args))
+        self.where = where
+        self.seen: dict[str, Holder | None] | None = None
+        self.taken_at: dict[str, float] = {}
+        self.changes: deque[str] = deque(maxlen=CHANGE_LOG_LINES)
+
+    def key(self, char: str) -> bool:
+        """Apply one key press; True when it quits."""
+        if char == "q":
+            return True
+        if char == "a":
+            self.args.all = not self.args.all
+        elif char == "d":
+            self.args.details = not self.args.details
+        return False
+
+    def update(self, data: list[Row], now: float) -> None:
+        current = {row.board.ip: row.holder for row in data}
+        if self.seen is None:
+            # A hold already running when the view starts dates from its process's start, as the age column does.
+            for ip, held in current.items():
+                if held is not None:
+                    self.taken_at[ip] = now - held.age_seconds if held.alive and held.age_seconds is not None else now
+            self.seen = current
+            return
+        clock = time.strftime("%H:%M:%S", time.localtime(now))
+        for ip, after in current.items():
+            before = self.seen.get(ip)
+            held_for = int(now - self.taken_at.get(ip, now))
+            note = change_note(ip if self.args.full_ip else ip_suffix(ip), before, after, held_for)
+            if note:
+                self.changes.append(f"{clock}  {note}")
+            if after is None:
+                self.taken_at.pop(ip, None)
+            elif holder_key(before) != holder_key(after):
+                self.taken_at[ip] = now
+        self.seen = current
+
+    def screen(self, data: list[Row], now: float, color: bool) -> list[str]:
+        lines = [live_header(data, now, self.args.watch, color, self.args.all, self.args.details), ""]
+        lines += frame_lines(self.args, data, color, self.where, title=False)
+        if self.changes:
+            lines += ["", *(paint(change, DIM, color) for change in self.changes)]
+        return lines
+
+
+def terminal_lines(stream) -> int:
+    """The terminal's height, or 24 when it has none to report: not a terminal, or a pty never given a size (0)."""
+    try:
+        return os.get_terminal_size(stream.fileno()).lines or 24
+    except (AttributeError, OSError, ValueError):
+        return 24
+
+
+def draw(stream, lines: list[str], height: int) -> None:
+    """Overwrite the screen in place: home, each line cleared to its end, then everything below cleared, so nothing
+    flickers. Lines past the terminal's height are cut, the change log first."""
+    shown = lines[: max(height, 1)]
+    stream.write(HOME + (CLEAR_LINE + "\n").join(shown) + CLEAR_LINE + CLEAR_BELOW)
+    stream.flush()
+
+
+def terminate(signum: int, frame: object) -> None:
+    """SIGTERM ends the live view through its finally block, which restores the terminal."""
+    raise SystemExit(128 + signum)
+
+
+def run_live(args: argparse.Namespace, stdin=None, stdout=None) -> int:
+    """Redraw every args.watch seconds until q (exit 0), Ctrl+C (exit 130) or SIGTERM (exit 143), then restore the
+    terminal. One select() on stdin is both the wait and the key reader; without a terminal on stdin it only waits."""
+    stdin = stdin or sys.stdin
+    stdout = stdout or sys.stdout
+    config_root, locks_dir = sources(args)
+    view = LiveView(args, f"{config_root / NETWORK_CONFIG} or {locks_dir}")
+    color = use_color(args.plain, stdout, args.color)
+    fd = stdin.fileno() if stdin.isatty() else None
+    saved = termios.tcgetattr(fd) if fd is not None else None
+    previous = signal.signal(signal.SIGTERM, terminate)
+    data: list[Row] | None = None
+    due = 0.0
+    try:
+        if fd is not None:
+            tty.setcbreak(fd)
+        stdout.write(ENTER_SCREEN)
+        while True:
+            if data is None or time.monotonic() >= due:
+                data = rows(config_root, locks_dir, include_unconfigured=not args.config_only)
+                view.update(data, time.time())
+                due = time.monotonic() + args.watch
+            draw(stdout, view.screen(data, time.time(), color), terminal_lines(stdout))
+            wait = max(due - time.monotonic(), 0.0)
+            if fd is None:
+                time.sleep(wait)
+                continue
+            ready, _, _ = select.select([fd], [], [], wait)
+            if ready:
+                char = os.read(fd, 1).decode(errors="replace")
+                if not char or view.key(char):
+                    return 0
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        stdout.write(LEAVE_SCREEN)
+        stdout.flush()
+        if saved is not None:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        signal.signal(signal.SIGTERM, previous)
+
+
+def positive_seconds(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number of seconds: {text!r}") from None
+    if not (math.isfinite(value) and value > 0):
+        raise argparse.ArgumentTypeError(f"must be a positive number of seconds: {text!r}")
+    return value
 
 
 def parser() -> argparse.ArgumentParser:
@@ -682,12 +914,29 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--json", action="store_true", help="emit JSON")
     cli.add_argument("--pretty", action="store_true", help="pretty-print JSON")
     cli.add_argument("--no-header", action="store_true", help="omit compact/detail header")
+    cli.add_argument(
+        "-n",
+        "--watch",
+        type=positive_seconds,
+        metavar="SECS",
+        help="on a terminal, redraw every SECS seconds; keys a (--all), d (--details), q (quit)",
+    )
+    cli.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="styling: auto (a terminal, unless NO_COLOR; FORCE_COLOR forces it), always or never",
+    )
     return cli
 
 
 def main() -> None:
+    args = parser().parse_args()
     try:
-        print_rows(parser().parse_args())
+        # Without a terminal there is nothing to redraw, so --watch prints one static frame.
+        if args.watch is not None and not args.json and sys.stdout.isatty():
+            sys.exit(run_live(args))
+        print_rows(args)
     except KeyboardInterrupt:
         print("\nStopped.")
     except BrokenPipeError:

@@ -19,7 +19,7 @@ The command column names the script from the process's command line: the first a
 `/proc/locks` records the PID that took a lock. When that process has exited and a child or a shell still holds the descriptor, as `exec 9>FILE; flock 9` leaves it, `boardhog` tries every PID the lock records, then the reader's own processes whose descriptor on the lock file holds the lock (`lock:` in `/proc/<pid>/fdinfo`), so a shell waiting for the lock never counts. Another user's descriptors are unreadable, so their row reads:
 
 ```text
-1.5   ● ?            @12:59?    -               (frame_2)  pid 2373047 exited
+2.5   ● ?            @12:59?    -               (frame_2)  pid 2373047 exited
 ```
 
 `@HH:MM?` is the lock file's mtime, shown only when it is later than host boot. Only a truncating open such as `exec 9>FILE` moves it, and a shell that waits for the lock moves it too, so it is a hint; otherwise the cell reads `-`. Such a row takes its state from that open time, or `medium` when there is none, never `long` for an unknown age.
@@ -31,6 +31,27 @@ Processes blocked on a board's lock (`->` lines in `/proc/locks`) show as a coun
 ## Styling
 
 On a terminal the title is bold, frame labels and notes are dim, and one accent, bold `#e46212`, marks the dot and note of a row whose holder exited and the dot of a hold in the `long` age bucket. Piped output, `--plain` and a non-empty `NO_COLOR` print no escape codes.
+
+`--color auto|always|never` overrides that. `--plain` never styles; otherwise `--color always` or `never` decides, then a non-empty `NO_COLOR` turns styles off, then a non-empty `FORCE_COLOR` turns them on, and under the default `auto` only a terminal gets them. `watch -n 1 boardhog --color always` keeps bold and dim, but procps `watch` drops 24-bit colour, so the accent shows as bold there.
+
+## Live view
+
+`boardhog -n 1` (or `--watch 1`) redraws every second in place on the terminal's alternate screen, with the same rows as a static run under one header line. Keys: `a` toggles `--all`, `d` toggles `--details`, `q` quits, and the hint of a toggle that is on shows bold; Ctrl+C exits with 130 and SIGTERM with 143, and each restores the terminal. Without a terminal on stdout, `-n` prints one static frame and exits; `--json` ignores it.
+
+```text
+boardhog  14:14:42  spinn48 5/10 free  spinn1 12/12 free  every 1s  a all  d details  q quit
+
+2.5   ● carol        11m 01s    hw_full.py      (frame_2)  +1 waiting
+2.21  ● dave         10m 04s    run_tree.py     (frame_1[0])
+2.22  ● dave         10m 04s    run_tree.py     (frame_1[1])
+2.23  ● dave         10m 04s    run_tree.py     (frame_1[2])  +1 waiting
+2.29  ● bob          1s         run_tier.sh     (frame_1[8])
+
+14:14:40  2.24 freed (alice pytest, held 42m 10s)
+14:14:41  2.29 taken by bob run_tier.sh
+```
+
+The header counts free boards out of all boards per network-config `type` (`248` reads `spinn48`, `201` reads `spinn1`); a board whose holder exited counts as taken, one without a lock file as not free. Under the rows, dim, are the last two changes the view saw: a board taken, freed (with how long it was held), handed over between two refreshes (one line, `2.21 alice pytest -> bob run_tier.sh (held 42m 10s)`), or its holder exited. A hold already running when the view starts dates from its process's start, as the age column does. The log lives only while the view runs. Lines past the terminal's height are cut, the change log first, and long lines are clipped at its width.
 
 ## Install
 
@@ -48,6 +69,7 @@ Common checks:
 boardhog                         # locked boards only
 boardhog --all                   # include free and missing boards
 boardhog --details               # lock file, PID, command, age
+boardhog -n 1                    # live view, redrawn every second
 ```
 
 Script output:
@@ -94,7 +116,7 @@ Boards cabled into one machine (`CABLED_GROUPS` in `boardhog.py`) get a bracket 
 
 ```text
 2.21 ┌● alice        12m 04s    run_tier.sh     (frame_1[0])
-2.22 │● alice        12m 04s    run_tier.sh     (frame_1[1])
+2.22 ├● alice        12m 04s    run_tier.sh     (frame_1[1])
 2.23 └● alice        12m 04s    run_tier.sh     (frame_1[2])
 ```
 

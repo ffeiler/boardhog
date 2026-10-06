@@ -147,7 +147,7 @@ def test_no_emoji_flag_rejected():
 
 
 GROUP = (("192.0.2.21", "192.0.2.22", "192.0.2.23"),)
-BRACKET_CHARS = {False: ("┌", "│", "└"), True: ("/", "|", "\\")}
+BRACKET_CHARS = {False: ("┌", "├", "└"), True: ("/", "|", "\\")}
 
 
 def _frame_row(last, holder=None, exists=True):

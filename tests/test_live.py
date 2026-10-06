@@ -1,0 +1,352 @@
+"""The live view (-n/--watch) and --color, against a fake /proc tree, a pty for stdin and a fake terminal for stdout.
+
+IPs are RFC 5737 documentation addresses (192.0.2.0/24, 198.51.100.0/24), not real boards.
+"""
+
+import contextlib
+import fcntl
+import io
+import os
+import pwd
+import signal
+import struct
+import sys
+import termios
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+import boardhog as bh
+
+CONFIG = """\
+frame_1:
+  type: 248
+  n_boards: 3
+  ETH_IP_START: 192.0.2.21
+
+b201_1:
+  type: 201
+  n_boards: 1
+  ETH_IP_START: 198.51.100.2
+"""
+ME = pwd.getpwuid(os.getuid()).pw_name
+LOCKS = ("192_0_2_21", "192_0_2_22", "192_0_2_23", "198_51_100_2")
+
+
+class Screen(io.StringIO):
+    """A terminal on stdout without a size, so the view falls back to 24 lines."""
+
+    def isatty(self):
+        return True
+
+
+@pytest.fixture
+def world(tmp_path, monkeypatch):
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    locks = tmp_path / "locks"
+    locks.mkdir()
+    (tmp_path / bh.NETWORK_CONFIG).write_text(CONFIG)
+    for name in LOCKS:
+        (locks / f"BOARD_{name}.lock").touch()
+    monkeypatch.setattr(bh, "PROC", proc)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    return SimpleNamespace(root=tmp_path, proc=proc, locks=locks)
+
+
+@pytest.fixture
+def terminal():
+    master, slave = os.openpty()
+    stdin = os.fdopen(slave, "rb", buffering=0)
+    yield SimpleNamespace(master=master, stdin=stdin, saved=termios.tcgetattr(slave))
+    stdin.close()
+    os.close(master)
+
+
+def lock_file(world, name):
+    return world.locks / f"BOARD_{name}.lock"
+
+
+def dev_inode(path):
+    stat = path.stat()
+    return f"{os.major(stat.st_dev):02x}:{os.minor(stat.st_dev):02x}:{stat.st_ino}"
+
+
+def write_locks(world, *entries):
+    """One /proc/locks line per (lock name, pid) holder."""
+    lines = [
+        f"{number}: FLOCK  ADVISORY  WRITE {pid} {dev_inode(lock_file(world, name))} 0 EOF"
+        for number, (name, pid) in enumerate(entries, 1)
+    ]
+    (world.proc / "locks").write_text("\n".join(lines) + "\n")
+
+
+def add_process(world, pid, argv, fds=()):
+    root = world.proc / str(pid)
+    (root / "fd").mkdir(parents=True)
+    (root / "fdinfo").mkdir()
+    (root / "status").write_text(f"Name:\tbash\nUid:\t{os.getuid()}\t{os.getuid()}\t0\t0\n")
+    (root / "comm").write_text("bash\n")
+    (root / "cmdline").write_bytes(b"".join(arg.encode() + b"\0" for arg in argv))
+    for number, target in enumerate(fds, 3):
+        (root / "fd" / str(number)).symlink_to(target.resolve())
+        (root / "fdinfo" / str(number)).write_text(
+            f"pos:\t0\nlock:\t1: FLOCK  ADVISORY  WRITE 1 {dev_inode(target)} 0 EOF\n"
+        )
+
+
+def live_args(world, *extra):
+    return bh.parser().parse_args(
+        ["-n", "60", "--config-root", str(world.root), "--locks-dir", str(world.locks), *extra]
+    )
+
+
+def holder(pid, user="alice", script="run.py", age=60, alive=True):
+    if alive:
+        return bh.Holder(pid=pid, user=user, command="python", age_seconds=age, script=script)
+    return bh.Holder(pid=pid, user="?", command="-", age_seconds=None, alive=False, source="none", dead_pid=pid)
+
+
+def snapshot(**held):
+    """Rows for 2.21-2.23 keyed by last octet, e.g. snapshot(b21=holder("500"))."""
+    return [
+        bh.Row(
+            bh.Board(ip=f"192.0.2.{last}", machine="frame_1", board_id=last - 21, board_type="248", n_boards=3),
+            Path("x"),
+            held.get(f"b{last}"),
+            True,
+        )
+        for last in (21, 22, 23)
+    ]
+
+
+def clock(now):
+    return time.strftime("%H:%M:%S", time.localtime(now))
+
+
+def test_watch_takes_positive_seconds():
+    assert bh.parser().parse_args(["-n", "1"]).watch == 1.0
+    assert bh.parser().parse_args(["--watch", "0.5"]).watch == 0.5
+    assert bh.parser().parse_args([]).watch is None
+    for bad in ("0", "-1", "nan", "inf", "x"):
+        with contextlib.redirect_stderr(io.StringIO()), pytest.raises(SystemExit) as exc:
+            bh.parser().parse_args(["-n", bad])
+        assert exc.value.code == 2, bad
+
+
+def test_color_precedence(monkeypatch):
+    tty = SimpleNamespace(isatty=lambda: True)
+    pipe = SimpleNamespace(isatty=lambda: False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    assert bh.use_color(False, tty) and not bh.use_color(False, pipe)
+    assert bh.use_color(False, pipe, "always") and not bh.use_color(False, tty, "never")
+    assert not bh.use_color(True, tty, "always")
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    assert bh.use_color(False, pipe)
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert not bh.use_color(False, pipe) and not bh.use_color(False, tty)
+    assert bh.use_color(False, pipe, "always")
+    monkeypatch.setenv("NO_COLOR", "")
+    monkeypatch.setenv("FORCE_COLOR", "")
+    assert not bh.use_color(False, pipe)
+
+
+def test_color_always_styles_piped_static_output(world, capsys):
+    where = ["--config-root", str(world.root), "--locks-dir", str(world.locks)]
+    bh.print_rows(bh.parser().parse_args(["--color", "always", *where]))
+    assert capsys.readouterr().out.startswith(bh.BOLD + "Unavailable Boards" + bh.RESET + "\n\n")
+    bh.print_rows(bh.parser().parse_args(where))
+    assert "\x1b" not in capsys.readouterr().out
+
+
+def test_header_counts_free_boards_per_type():
+    data = snapshot(b22=holder("500"), b23=holder("600", alive=False))
+    data.append(bh.Row(bh.Board(ip="198.51.100.2", machine="b", board_type="201"), Path("x"), None, True))
+    data.append(bh.Row(bh.Board(ip="198.51.100.3", machine="c", board_type="201"), Path("x"), None, False))
+    data.append(bh.Row(bh.Board(ip="203.0.113.9", configured=False), Path("x"), None, True))
+    assert bh.type_counts(data) == [("spinn48", 1, 3), ("spinn1", 1, 2)]
+    now = time.time()
+    assert bh.live_header(data, now, 1.0, False) == (
+        f"boardhog  {clock(now)}  spinn48 1/3 free  spinn1 1/2 free  every 1s  a all  d details  q quit"
+    )
+    styled = bh.live_header(data, now, 0.5, True)
+    assert styled.startswith(bh.BOLD + "boardhog" + bh.RESET + "  " + bh.DIM + clock(now) + bh.RESET)
+    assert bh.DIM + "every 0.5s" + bh.RESET in styled
+
+
+def test_key_hints_show_which_toggles_are_on():
+    def hints(show_all, details):
+        styled = bh.live_header([], 0.0, 1.0, True, show_all, details)
+        return styled.split(bh.DIM + "every 1s" + bh.RESET + "  ", 1)[1]
+
+    def dim(text):
+        return bh.DIM + text + bh.RESET
+
+    def bold(text):
+        return bh.BOLD + text + bh.RESET
+
+    assert hints(False, False) == "  ".join([dim("a all"), dim("d details"), dim("q quit")])
+    assert hints(True, False) == "  ".join([bold("a all"), dim("d details"), dim("q quit")])
+    assert hints(True, True) == "  ".join([bold("a all"), bold("d details"), dim("q quit")])
+    assert bh.live_header([], 0.0, 1.0, False, True, True).endswith("every 1s  a all  d details  q quit")
+    view = bh.LiveView(bh.parser().parse_args(["-n", "1", "--details"]), "nowhere")
+    assert bh.BOLD + "d details" in view.screen([], 0.0, True)[0]
+    view.key("d")
+    assert bh.DIM + "d details" in view.screen([], 0.0, True)[0]
+
+
+def test_change_log_notes_taken_freed_and_exited():
+    view = bh.LiveView(bh.parser().parse_args(["-n", "1"]), "nowhere")
+    start = time.time()
+    view.update(snapshot(b21=holder("500", age=60), b23=holder("600", user="bob", script="x.py")), start)
+    assert list(view.changes) == []
+    later = start + 10
+    view.update(snapshot(b22=holder("700", user="carol"), b23=holder("600", alive=False)), later)
+    assert list(view.changes) == [
+        f"{clock(later)}  2.22 taken by carol run.py",
+        f"{clock(later)}  2.23 holder pid 600 exited (bob x.py)",
+    ]
+    view = bh.LiveView(bh.parser().parse_args(["-n", "1"]), "nowhere")
+    view.update(snapshot(b21=holder("500", age=60)), start)
+    view.update(snapshot(b21=holder("500", age=70), b22=holder("700", user="carol")), start + 10)
+    view.update(snapshot(), start + 15)
+    assert list(view.changes) == [
+        f"{clock(start + 15)}  2.21 freed (alice run.py, held 1m 15s)",
+        f"{clock(start + 15)}  2.22 freed (carol run.py, held 5s)",
+    ]
+
+
+def test_change_log_ignores_finding_the_shell_behind_an_exited_pid():
+    view = bh.LiveView(bh.parser().parse_args(["-n", "1"]), "nowhere")
+    found = bh.Holder(pid="4321", user=ME, command="bash", age_seconds=5, source="fd", dead_pid="777")
+    view.update(snapshot(b21=holder("777", alive=False)), time.time())
+    view.update(snapshot(b21=found), time.time())
+    view.update(snapshot(b22=holder("800", alive=False), b21=found), time.time())
+    assert [change.split("  ", 1)[1] for change in view.changes] == ["2.22 taken, holder pid 800 exited"]
+
+
+def test_a_handover_is_one_line_naming_both_holders():
+    view = bh.LiveView(bh.parser().parse_args(["-n", "1"]), "nowhere")
+    start = time.time()
+    view.update(snapshot(b21=holder("500", user="ekagupta", script="ring_chip_mc", age=2520)), start)
+    view.update(snapshot(b21=holder("600", user="carol", script="pytest", age=1)), start + 10)
+    view.update(snapshot(b21=holder("700", alive=False)), start + 15)
+    assert list(view.changes) == [
+        f"{clock(start + 10)}  2.21 ekagupta ring_chip_mc -> carol pytest (held 42m 10s)",
+        f"{clock(start + 15)}  2.21 carol pytest -> pid 700 (held 5s)",
+    ]
+
+
+def test_one_proc_pass_serves_every_exited_holder(world, monkeypatch):
+    add_process(world, 4321, ["bash", "a.sh"], fds=[lock_file(world, "192_0_2_21")])
+    add_process(world, 4322, ["bash", "b.sh"], fds=[lock_file(world, "192_0_2_22")])
+    write_locks(world, ("192_0_2_21", 901), ("192_0_2_22", 902))
+    calls = []
+    original = bh.lock_fds
+
+    def counted(paths):
+        calls.append(len(paths))
+        return original(paths)
+
+    monkeypatch.setattr(bh, "lock_fds", counted)
+    data = {row.board.ip: row.holder for row in bh.rows(world.root, world.locks, include_unconfigured=True)}
+    assert calls == [2]
+    assert (data["192.0.2.21"].pid, data["192.0.2.21"].dead_pid) == ("4321", "901")
+    assert (data["192.0.2.22"].pid, data["192.0.2.22"].dead_pid) == ("4322", "902")
+    assert bh.fd_holder(lock_file(world, "192_0_2_21"), exclude=set()) == "4321"
+
+
+def test_one_frame_keys_and_draw(world):
+    add_process(world, 500, ["python", "run.py"])
+    write_locks(world, ("192_0_2_22", 500))
+    view = bh.LiveView(live_args(world), "nowhere")
+    data = bh.rows(world.root, world.locks, include_unconfigured=True)
+    now = time.time()
+    view.update(data, now)
+    lines = view.screen(data, now, False)
+    assert lines[0] == f"boardhog  {clock(now)}  spinn48 2/3 free  spinn1 1/1 free  every 60s  a all  d details  q quit"
+    assert lines[1] == "" and [line.split()[0] for line in lines[2:]] == ["2.22"]
+    assert not view.key("a") and view.screen(data, now, False)[-1] == "free  2.21 2.23 100.2"
+    assert not view.key("d") and view.screen(data, now, False)[2].startswith(
+        "192.0.2.21      (BOARD_192_0_2_21.lock): free"
+    )
+    assert not view.key("x") and view.key("q")
+    master, slave = os.openpty()
+    try:
+        assert bh.terminal_lines(os.fdopen(slave, closefd=False)) == 24
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+        assert bh.terminal_lines(os.fdopen(slave, closefd=False)) == 40
+    finally:
+        os.close(master)
+        os.close(slave)
+    screen = Screen()
+    assert bh.terminal_lines(screen) == 24
+    bh.draw(screen, ["a", "b", "c", "d"], height=3)
+    assert screen.getvalue() == bh.HOME + "a\x1b[K\nb\x1b[K\nc\x1b[K\x1b[J"
+
+
+def test_live_loop_reads_keys_and_restores_the_terminal(world, terminal, monkeypatch):
+    add_process(world, 500, ["python", "run.py"])
+    write_locks(world, ("192_0_2_22", 500))
+    frames = []
+    original = bh.draw
+
+    def typing_draw(stream, lines, height):
+        frames.append(lines)
+        os.write(terminal.master, b"a" if len(frames) == 1 else b"q")
+        original(stream, lines, height)
+
+    monkeypatch.setattr(bh, "draw", typing_draw)
+    screen = Screen()
+    term_handler = signal.getsignal(signal.SIGTERM)
+    assert bh.run_live(live_args(world), terminal.stdin, screen) == 0
+    assert len(frames) == 2
+    # stdout is a terminal, so the frames are styled.
+    summary = bh.DIM + "free  2.21 2.23 100.2" + bh.RESET
+    assert summary not in frames[0] and frames[1][-1] == summary
+    assert frames[0][0].startswith(bh.BOLD + "boardhog" + bh.RESET)
+    assert screen.getvalue().startswith(bh.ENTER_SCREEN + bh.HOME) and screen.getvalue().endswith(bh.LEAVE_SCREEN)
+    assert termios.tcgetattr(terminal.stdin.fileno()) == terminal.saved
+    assert signal.getsignal(signal.SIGTERM) == term_handler
+
+
+def test_live_loop_restores_the_terminal_on_ctrl_c_and_sigterm(world, terminal, monkeypatch):
+    def interrupted(stream, lines, height):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(bh, "draw", interrupted)
+    screen = Screen()
+    assert bh.run_live(live_args(world), terminal.stdin, screen) == 130
+    assert screen.getvalue() == bh.ENTER_SCREEN + bh.LEAVE_SCREEN
+    assert termios.tcgetattr(terminal.stdin.fileno()) == terminal.saved
+
+    def terminated(stream, lines, height):
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    monkeypatch.setattr(bh, "draw", terminated)
+    term_handler = signal.getsignal(signal.SIGTERM)
+    screen = Screen()
+    with pytest.raises(SystemExit) as exc:
+        bh.run_live(live_args(world), terminal.stdin, screen)
+    assert exc.value.code == 128 + signal.SIGTERM
+    assert screen.getvalue().endswith(bh.LEAVE_SCREEN)
+    assert termios.tcgetattr(terminal.stdin.fileno()) == terminal.saved
+    assert signal.getsignal(signal.SIGTERM) == term_handler
+
+
+def test_watch_without_a_terminal_prints_one_static_frame(world, capsys, monkeypatch):
+    add_process(world, 500, ["python", "run.py"])
+    write_locks(world, ("192_0_2_22", 500))
+    where = ["--config-root", str(world.root), "--locks-dir", str(world.locks)]
+    monkeypatch.setattr(bh, "run_live", lambda *args, **kwargs: pytest.fail("live view without a terminal"))
+    monkeypatch.setattr(sys, "argv", ["boardhog", *where])
+    bh.main()
+    static = capsys.readouterr().out
+    monkeypatch.setattr(sys, "argv", ["boardhog", "-n", "1", *where])
+    bh.main()
+    assert capsys.readouterr().out == static
+    assert static.startswith("Unavailable Boards\n\n2.22")
