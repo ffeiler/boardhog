@@ -11,10 +11,13 @@ import os
 import pwd
 import re
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 
 
+PROC = Path("/proc")
 CONFIG_POINTER = Path("/etc/opt/spinnaker/SPINNAKER_CONFIG_PATH")
 DEFAULT_CONFIG_ROOT = Path("/mnt/spinnaker")
 NETWORK_CONFIG = "spinnaker2_network_config.yml"
@@ -36,6 +39,14 @@ SYMBOLS = {
 }
 STATE_WIDTH = max(len(state) for state in SYMBOLS)
 SYMBOL_WIDTH = max(len(symbol) for symbol in SYMBOLS.values())
+# A holder that exited without a usable open time has no age; it reads medium so an unknown age never lands in long.
+DEAD_UNKNOWN_STATE = "medium"
+
+# Terminal styles: bold, dim and one accent, #e46212, always bold so it survives a terminal without colour.
+BOLD = "\x1b[1m"
+DIM = "\x1b[2m"
+ACCENT = "\x1b[1;38;2;228;98;18m"
+RESET = "\x1b[0m"
 
 # Boards cabled into one machine, in IP order. The network config does not mark them, so they are listed here.
 CABLED_GROUPS = (("192.168.1.21", "192.168.1.22", "192.168.1.23"),)
@@ -78,6 +89,19 @@ class Holder:
     user: str
     command: str
     age_seconds: int | None
+    script: str | None = None
+    alive: bool = True
+    # proc: a PID /proc/locks records; fd: the reader's own process with the lock file open; none: no live holder found.
+    source: str = "proc"
+    dead_pid: str | None = None
+    # The lock file's mtime, kept for a holder that exited when it is later than host boot.
+    opened_at: float | None = None
+
+
+@dataclass(frozen=True)
+class LockPids:
+    holders: list[str] = field(default_factory=list)
+    waiters: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -86,14 +110,20 @@ class Row:
     lock_path: Path
     holder: Holder | None
     lock_file_exists: bool
+    waiters: tuple[Holder, ...] = ()
+    lock_mtime: float | None = None
 
     @property
     def state(self) -> str:
         if not self.lock_file_exists:
             return "missing"
-        if self.holder is not None:
+        if self.holder is None:
+            return "free"
+        if self.holder.alive:
             return age_state(self.holder.age_seconds)
-        return "free"
+        if self.holder.opened_at is None:
+            return DEAD_UNKNOWN_STATE
+        return age_state(int(time.time() - self.holder.opened_at))
 
 
 def read_config_root(pointer: Path = CONFIG_POINTER) -> Path:
@@ -199,24 +229,24 @@ def ip_suffix(ip: str) -> str:
     return ".".join(ip.split(".")[2:])
 
 
-def proc_locks(path: Path = Path("/proc/locks")) -> dict[tuple[str, str], str]:
-    locks: dict[tuple[str, str], str] = {}
+def proc_locks(path: Path | None = None) -> dict[tuple[str, str], LockPids]:
+    locks: dict[tuple[str, str], LockPids] = {}
 
     try:
-        lines = path.read_text().splitlines()
+        lines = (path or PROC / "locks").read_text().splitlines()
     except OSError:
         return locks
 
     for line in lines:
         fields = line.split()
-        for index, field in enumerate(fields[:-1]):
-            if not PID_RE.match(field):
+        for index, token in enumerate(fields[:-1]):
+            if not PID_RE.match(token):
                 continue
             match = DEV_INODE_RE.match(fields[index + 1])
-            if match and field != "-1":
-                # setdefault keeps the first PID per inode: in /proc/locks the holder
-                # is listed before its "->" waiters, so this resolves to the holder.
-                locks.setdefault((match.group(1).lower(), match.group(2)), field)
+            if match and token != "-1":
+                entry = locks.setdefault((match.group(1).lower(), match.group(2)), LockPids())
+                # A "->" line is a process blocked on the lock; every other line holds it.
+                (entry.waiters if "->" in fields else entry.holders).append(token)
             break
 
     return locks
@@ -231,28 +261,136 @@ def lock_key(path: Path) -> tuple[str, str] | None:
     return (device.lower(), str(stat.st_ino))
 
 
+def lock_mtime(path: Path) -> float | None:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def boot_time() -> float | None:
+    for line in (read_text(PROC / "stat") or "").splitlines():
+        if line.startswith("btime "):
+            try:
+                return float(line.split()[1])
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
 def rows(config_root: Path, locks_dir: Path, include_unconfigured: bool) -> list[Row]:
     locks = proc_locks()
+    boot = boot_time()
 
     def resolve(board: Board) -> Row:
         lock_path = locks_dir / board.lock_name
         key = lock_key(lock_path)
-        pid = locks.get(key) if key else None
-        return Row(board, lock_path, holder(pid) if pid else None, lock_path.exists())
+        entry = locks.get(key) if key else None
+        mtime = lock_mtime(lock_path)
+        # Only a truncating open, such as a shell's `exec 9>FILE`, moves the mtime, so one from before boot says nothing.
+        opened_at = mtime if mtime is not None and boot is not None and mtime > boot else None
+        held = resolve_holder(entry, lock_path, opened_at) if entry else None
+        waiters = tuple(holder(pid) for pid in entry.waiters) if entry else ()
+        return Row(board, lock_path, held, lock_path.exists(), waiters, mtime)
 
     return [resolve(board) for board in inventory(config_root, locks_dir, include_unconfigured)]
+
+
+def resolve_holder(entry: LockPids, lock_path: Path, opened_at: float | None) -> Holder | None:
+    """The lock's holder: a recorded PID still running, else the reader's own process with the lock file open, else
+    the first recorded PID marked exited. Another user's descriptors are unreadable, so only the reader's own
+    processes can stand in for a PID that exited."""
+    if not entry.holders:
+        return None
+    for pid in entry.holders:
+        if (PROC / pid).is_dir():
+            return holder(pid)
+    dead = entry.holders[0]
+    owner = fd_holder(lock_path, exclude=set(entry.waiters))
+    if owner is not None:
+        return replace(holder(owner), source="fd", dead_pid=dead)
+    return Holder(
+        pid=dead,
+        user="?",
+        command="-",
+        age_seconds=None,
+        alive=False,
+        source="none",
+        dead_pid=dead,
+        opened_at=opened_at,
+    )
+
+
+def fd_holder(lock_path: Path, exclude: set[str]) -> str | None:
+    """A process whose descriptor on the lock file holds the lock, as a shell's does after its flock helper exits.
+
+    Waiters and their shells also have the file open, but their fdinfo lists no granted lock."""
+    try:
+        target = str(lock_path.resolve())
+        entries = sorted((entry for entry in PROC.iterdir() if entry.name.isdigit()), key=lambda e: int(e.name))
+    except OSError:
+        return None
+    for entry in entries:
+        if entry.name in exclude:
+            continue
+        try:
+            for fd in (entry / "fd").iterdir():
+                if os.readlink(fd) == target and holds_lock(entry / "fdinfo" / fd.name):
+                    return entry.name
+        except OSError:
+            continue
+    return None
+
+
+def holds_lock(fdinfo: Path) -> bool:
+    """Whether the open file behind a descriptor holds a lock: fdinfo lists each lock granted to it as a `lock:` line,
+    so a shell that opened the file to wait for the lock does not count."""
+    lines = (read_text(fdinfo) or "").splitlines()
+    return any(line.startswith("lock:") and "->" not in line for line in lines)
 
 
 def holder(pid: str) -> Holder:
     uid = process_uid(pid)
     user = user_from_uid(uid) if uid is not None else "unknown"
-    command = read_text(Path("/proc") / pid / "comm") or "unknown"
-    return Holder(pid=pid, user=user, command=command, age_seconds=process_age_seconds(pid))
+    command = read_text(PROC / pid / "comm") or "unknown"
+    return Holder(pid=pid, user=user, command=command, age_seconds=process_age_seconds(pid), script=script_name(pid))
+
+
+def script_name(pid: str) -> str | None:
+    """What a process runs: the first argument ending .py or .sh, the module after `-m`, the first argument of a
+    Python interpreter (a console script such as pytest), else argv[0]'s basename. None for an unreadable or empty
+    command line."""
+    try:
+        raw = (PROC / pid / "cmdline").read_bytes()
+    except OSError:
+        return None
+    argv = [part.decode(errors="replace") for part in raw.split(b"\0") if part]
+    if not argv:
+        return None
+    program = os.path.basename(argv[0])
+    if program.startswith("python"):
+        # The interpreter's options come before the module, script or console script it runs; what follows is theirs.
+        rest = iter(argv[1:])
+        for arg in rest:
+            if arg == "-m":
+                return next(rest, program)
+            if arg == "-c":
+                return program
+            if arg in ("-W", "-X"):
+                next(rest, None)
+            elif not arg.startswith("-"):
+                return os.path.basename(arg)
+        return program
+    return next((os.path.basename(arg) for arg in argv if arg.endswith((".py", ".sh"))), program)
+
+
+def display_command(holder: Holder) -> str:
+    return holder.script or holder.command
 
 
 def process_uid(pid: str) -> int | None:
     try:
-        with (Path("/proc") / pid / "status").open() as handle:
+        with (PROC / pid / "status").open() as handle:
             for line in handle:
                 if line.startswith("Uid:"):
                     return int(line.split()[1])
@@ -276,8 +414,8 @@ def read_text(path: Path) -> str | None:
 
 
 def process_age_seconds(pid: str) -> int | None:
-    stat = read_text(Path("/proc") / pid / "stat")
-    uptime = read_text(Path("/proc/uptime"))
+    stat = read_text(PROC / pid / "stat")
+    uptime = read_text(PROC / "uptime")
     if not stat or not uptime:
         return None
     try:
@@ -311,23 +449,54 @@ def duration(seconds: int | None) -> str:
     return f"{seconds}s"
 
 
+def opened_clock(holder: Holder) -> str | None:
+    return None if holder.opened_at is None else time.strftime("%H:%M", time.localtime(holder.opened_at))
+
+
+def age_cell(holder: Holder) -> str:
+    if holder.alive:
+        return duration(holder.age_seconds)
+    clock = opened_clock(holder)
+    # The lock file's last truncating open, a hint at when an exited holder took the lock.
+    return "-" if clock is None else f"@{clock}?"
+
+
 def holder_columns(holder: Holder, show_pid: bool) -> str:
-    # Widths fit an age under ten days, a full 15-character kernel comm name and a PID up to pid_max.
+    # Widths fit an age under ten days or "@HH:MM?", 15 characters of the script or kernel comm name and a PID up to
+    # pid_max. A longer script name is cut to 15, as the kernel cuts comm.
     pid = f" PID={holder.pid:<7}" if show_pid else ""
-    return f"{holder.user:<12} {duration(holder.age_seconds):<10} {holder.command:<15}{pid}"
+    return f"{holder.user:<12} {age_cell(holder):<10} {display_command(holder)[:15]:<15}{pid}"
 
 
-def compact(row: Row, full_ip: bool, show_pid: bool, plain: bool, mark: str = " ") -> str:
+def paint(text: str, style: str, color: bool) -> str:
+    return f"{style}{text}{RESET}" if color and text else text
+
+
+def use_color(plain: bool, stream=None) -> bool:
+    """Styles only on a terminal, and never under --plain or a non-empty NO_COLOR."""
+    stream = stream or sys.stdout
+    return not plain and not os.environ.get("NO_COLOR") and stream.isatty()
+
+
+def compact(row: Row, full_ip: bool, show_pid: bool, plain: bool, mark: str = " ", color: bool = False) -> str:
     label = row.board.ip if full_ip else ip_suffix(row.board.ip)
     label_width = 15 if full_ip else 5
     symbol_width = STATE_WIDTH if plain else SYMBOL_WIDTH
-    head = f"{label:<{label_width}}{mark}{status_symbol(row.state, plain):<{symbol_width}}"
+    symbol = f"{status_symbol(row.state, plain):<{symbol_width}}"
+    if row.holder is not None and (not row.holder.alive or row.state == "long"):
+        symbol = paint(symbol, ACCENT, color)
+    head = f"{label:<{label_width}}{mark}{symbol}"
 
     if row.state == "missing":
         return f"{head} {row.board.label} (no {row.board.lock_name})"
     if row.holder is None:
         return f"{head} {row.board.label}"
-    return f"{head} {holder_columns(row.holder, show_pid)} ({row.board.label})"
+    line = f"{head} {holder_columns(row.holder, show_pid)} {paint(f'({row.board.label})', DIM, color)}"
+    if not row.holder.alive:
+        line += "  " + paint(f"pid {row.holder.dead_pid} exited", ACCENT, color)
+    if row.waiters:
+        line += "  " + paint(f"+{len(row.waiters)} waiting", DIM, color)
+    return line
 
 
 def group_marks(visible: list[Row], plain: bool, groups: tuple[tuple[str, ...], ...] = CABLED_GROUPS) -> list[str]:
@@ -357,9 +526,30 @@ def compact_lines(
     show_pid: bool,
     plain: bool,
     groups: tuple[tuple[str, ...], ...] = CABLED_GROUPS,
+    color: bool = False,
 ) -> list[str]:
     marks = group_marks(visible, plain, groups)
-    return [compact(row, full_ip, show_pid, plain, mark) for row, mark in zip(visible, marks)]
+    return [compact(row, full_ip, show_pid, plain, mark, color) for row, mark in zip(visible, marks)]
+
+
+def free_summary(visible: list[Row], full_ip: bool) -> str | None:
+    """One line naming the free boards, consecutive addresses joined into a range."""
+    runs: list[list[str]] = []
+    for row in visible:
+        if row.state != "free":
+            continue
+        ip = row.board.ip
+        if runs and ip_key(ip)[:-1] == ip_key(runs[-1][-1])[:-1] and ip_key(ip)[-1] == ip_key(runs[-1][-1])[-1] + 1:
+            runs[-1].append(ip)
+        else:
+            runs.append([ip])
+    if not runs:
+        return None
+
+    def label(ip: str) -> str:
+        return ip if full_ip else ip_suffix(ip)
+
+    return "free  " + " ".join(label(run[0]) if len(run) == 1 else f"{label(run[0])}-{label(run[-1])}" for run in runs)
 
 
 def detailed(row: Row) -> str:
@@ -368,8 +558,27 @@ def detailed(row: Row) -> str:
         return f"{prefix} missing lock file"
     if row.holder is None:
         return f"{prefix} free (no lock held)"
-    age = duration(row.holder.age_seconds)
-    return f"{prefix} locked by {row.holder.user} (PID={row.holder.pid}, CMD={row.holder.command}) for {age}"
+    held = row.holder
+    if held.alive:
+        line = f"{prefix} locked by {held.user} (PID={held.pid}, CMD={display_command(held)}) for {duration(held.age_seconds)}"
+        if held.dead_pid:
+            line += f", recorded PID={held.dead_pid} exited"
+    else:
+        clock = opened_clock(held)
+        opened = "open time unknown" if clock is None else f"lock file opened {clock}"
+        line = f"{prefix} locked, holder PID={held.dead_pid} exited, {opened}"
+    for waiter in row.waiters:
+        line += (
+            f"\n    waiting: {waiter.user} (PID={waiter.pid}, CMD={display_command(waiter)})"
+            f" for {duration(waiter.age_seconds)}"
+        )
+    return line
+
+
+def iso(timestamp: float | None) -> str | None:
+    if timestamp is None:
+        return None
+    return datetime.fromtimestamp(timestamp).astimezone().isoformat(timespec="seconds")
 
 
 def holder_json(holder: Holder | None) -> dict[str, object] | None:
@@ -379,8 +588,12 @@ def holder_json(holder: Holder | None) -> dict[str, object] | None:
         "pid": holder.pid,
         "user": holder.user,
         "command": holder.command,
+        "script": holder.script,
         "age_seconds": holder.age_seconds,
         "age": duration(holder.age_seconds),
+        "alive": holder.alive,
+        "source": holder.source,
+        "dead_pid": holder.dead_pid,
     }
 
 
@@ -395,8 +608,10 @@ def as_json(row: Row) -> dict[str, object]:
         "lock_name": row.board.lock_name,
         "lock_path": str(row.lock_path),
         "lock_file_exists": row.lock_file_exists,
+        "lock_mtime": iso(row.lock_mtime),
         "state": row.state,
         "holder": holder_json(row.holder),
+        "waiters": [holder_json(waiter) for waiter in row.waiters],
     }
 
 
@@ -427,8 +642,9 @@ def print_rows(args: argparse.Namespace) -> None:
         )
         return
 
+    color = use_color(args.plain)
     if not args.no_header:
-        print(("Board Status" if args.all else "Unavailable Boards") + "\n")
+        print(paint("Board Status" if args.all else "Unavailable Boards", BOLD, color) + "\n")
 
     if not data:
         print(f"No boards found in {config_root / NETWORK_CONFIG} or {locks_dir}")
@@ -441,8 +657,16 @@ def print_rows(args: argparse.Namespace) -> None:
         for row in visible:
             print(detailed(row))
         return
-    for line in compact_lines(visible, full_ip=args.full_ip, show_pid=args.pid, plain=args.plain):
+    # Under --all the free boards fold into one summary line; --plain keeps one row per board for scripts.
+    collapse = args.all and not args.plain
+    listed = [row for row in visible if not (collapse and row.state == "free")]
+    for line in compact_lines(listed, full_ip=args.full_ip, show_pid=args.pid, plain=args.plain, color=color):
         print(line)
+    summary = free_summary(visible, args.full_ip) if collapse else None
+    if summary:
+        if listed:
+            print()
+        print(paint(summary, DIM, color))
 
 
 def parser() -> argparse.ArgumentParser:
