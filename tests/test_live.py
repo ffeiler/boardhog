@@ -191,11 +191,19 @@ def test_key_hints_show_which_toggles_are_on():
     def bold(text):
         return bh.BOLD + text + bh.RESET
 
-    assert hints(False, False) == "  ".join([dim("a all"), dim("d details"), dim("w waiting"), dim("q quit")])
-    assert hints(True, False) == "  ".join([bold("a all"), dim("d details"), dim("w waiting"), dim("q quit")])
-    assert hints(True, True) == "  ".join([bold("a all"), bold("d details"), dim("w waiting"), dim("q quit")])
-    assert bh.live_footer(1.0, True, waiting=True).endswith(bold("w waiting") + "  " + dim("q quit"))
-    assert bh.live_footer(1.0, False, True, True, True) == "every 1s  a all  d details  w waiting  q quit"
+    assert hints(False, False) == "  ".join(
+        [dim("a all"), dim("d details"), dim("w waiting"), bold("l log"), dim("q quit")]
+    )
+    assert hints(True, False) == "  ".join(
+        [bold("a all"), dim("d details"), dim("w waiting"), bold("l log"), dim("q quit")]
+    )
+    assert hints(True, True) == "  ".join(
+        [bold("a all"), bold("d details"), dim("w waiting"), bold("l log"), dim("q quit")]
+    )
+    assert bh.live_footer(1.0, True, waiting=True).endswith(
+        bold("w waiting") + "  " + bold("l log") + "  " + dim("q quit")
+    )
+    assert bh.live_footer(1.0, False, True, True, True) == "every 1s  a all  d details  w waiting  l log  q quit"
     view = bh.LiveView(bh.parser().parse_args(["-n", "1", "--details"]), "nowhere")
     assert bh.BOLD + "d details" in view.screen([], 0.0, True)[-1]
     view.key("d")
@@ -203,13 +211,15 @@ def test_key_hints_show_which_toggles_are_on():
     assert bh.DIM + "w waiting" in view.screen([], 0.0, True)[-1]
     view.key("w")
     assert bh.BOLD + "w waiting" in view.screen([], 0.0, True)[-1]
+    view.key("l")
+    assert bh.DIM + "l log" in view.screen([], 0.0, True)[-1]
 
 
 def test_a_short_window_cuts_the_change_log_then_rows_and_keeps_the_footer():
     view = bh.LiveView(bh.parser().parse_args(["-n", "1", "--all", "--plain"]), "nowhere")
     data = snapshot(b21=holder("500"), b22=holder("501"), b23=holder("502"))
     view.changes.extend(["12:00:00  2.21 taken by alice run.py", "12:00:01  2.22 taken by alice run.py"])
-    footer = "every 1s  a all  d details  w waiting  q quit"
+    footer = "every 1s  a all  d details  w waiting  l log  q quit"
     full = view.screen(data, 0.0, False)
     header, rows, changes = full[0], full[2:5], full[6:8]
     assert full == [header, "", *rows, "", *changes, "", footer]
@@ -217,6 +227,11 @@ def test_a_short_window_cuts_the_change_log_then_rows_and_keeps_the_footer():
     assert view.screen(data, 0.0, False, height=9) == [header, "", *rows, "", changes[1], "", footer]
     assert view.screen(data, 0.0, False, height=7) == [header, "", *rows, "", footer]
     assert view.screen(data, 0.0, False, height=6) == [header, "", *rows[:2], "", footer]
+    view.key("l")
+    assert view.screen(data, 0.0, False) == [header, "", *rows, "", footer]
+    assert len(view.changes) == 2
+    view.key("l")
+    assert view.screen(data, 0.0, False) == full
     for height in range(1, 12):
         lines = view.screen(data, 0.0, False, height=height)
         assert len(lines) <= height and lines[-1] == footer, height
@@ -387,7 +402,7 @@ def test_one_frame_keys_and_draw(world):
     lines = view.screen(data, now, False)
     assert lines[0] == f"boardhog  {clock(now)}  spinn48 2/3 free  spinn1 1/1 free"
     assert lines[1] == "" and [line.split()[0] for line in lines[2:-2]] == ["2.22"]
-    assert lines[-2:] == ["", "every 60s  a all  d details  w waiting  q quit"]
+    assert lines[-2:] == ["", "every 60s  a all  d details  w waiting  l log  q quit"]
     assert not view.key("a") and view.screen(data, now, False)[-3] == "free  2.21 2.23 100.2"
     assert not view.key("d") and view.screen(data, now, False)[2].startswith(
         "192.0.2.21      (BOARD_192_0_2_21.lock): free"

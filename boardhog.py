@@ -62,7 +62,7 @@ HOME = "\x1b[H"
 CLEAR_LINE = "\x1b[K"
 CLEAR_BELOW = "\x1b[J"
 # Key hints: a hint whose toggle is on shows bold, the rest dim.
-LIVE_KEYS = (("a", "all"), ("d", "details"), ("w", "waiting"), ("q", "quit"))
+LIVE_KEYS = (("a", "all"), ("d", "details"), ("w", "waiting"), ("l", "log"), ("q", "quit"))
 CHANGE_LOG_LINES = 2
 # Header names per network-config board type; another type shows as its raw value.
 TYPE_NAMES = {"248": "spinn48", "201": "spinn1"}
@@ -778,10 +778,10 @@ def live_header(data: list[Row], now: float, color: bool) -> str:
 
 
 def live_footer(
-    interval: float, color: bool, show_all: bool = False, details: bool = False, waiting: bool = False
+    interval: float, color: bool, show_all: bool = False, details: bool = False, waiting: bool = False, log: bool = True
 ) -> str:
     cells = [paint(f"every {interval:g}s", DIM, color)]
-    active = {"a": show_all, "d": details, "w": waiting, "q": False}
+    active = {"a": show_all, "d": details, "w": waiting, "l": log, "q": False}
     cells += [paint(f"{key} {word}", BOLD if active[key] else DIM, color) for key, word in LIVE_KEYS]
     return "  ".join(cells)
 
@@ -823,6 +823,7 @@ class LiveView:
         self.changes: deque[str] = deque(maxlen=CHANGE_LOG_LINES)
         # The `w` key: waiter lines under the holder rows. The live view alone has it; --details lists waiters too.
         self.waiting = False
+        self.log = True
 
     def key(self, char: str) -> bool:
         """Apply one key press; True when it quits."""
@@ -834,6 +835,8 @@ class LiveView:
             self.args.details = not self.args.details
         elif char == "w":
             self.waiting = not self.waiting
+        elif char == "l":
+            self.log = not self.log
         return False
 
     def update(self, data: list[Row], now: float) -> None:
@@ -864,7 +867,7 @@ class LiveView:
         bottom; the header and footer stay."""
         waiters = sum(len(row.waiters) for row in data) if self.waiting else 0
         body = frame_lines(self.args, data, color, self.where, title=False, waiters=waiters)
-        log = [paint(change, DIM, color) for change in self.changes]
+        log = [paint(change, DIM, color) for change in self.changes] if self.log else []
         if height is not None:
             # Four lines go to the header, the footer and the blank line under and over each.
             room = height - 4
@@ -883,7 +886,7 @@ class LiveView:
         lines = [live_header(data, now, color), "", *body]
         if log:
             lines += ["", *log]
-        lines += ["", live_footer(self.args.watch, color, self.args.all, self.args.details, self.waiting)]
+        lines += ["", live_footer(self.args.watch, color, self.args.all, self.args.details, self.waiting, self.log)]
         return lines if height is None else lines[-max(height, 1) :]
 
 
@@ -979,7 +982,7 @@ def parser() -> argparse.ArgumentParser:
         "--watch",
         type=positive_seconds,
         metavar="SECS",
-        help="on a terminal, redraw every SECS seconds; keys a (--all), d (--details), w (waiters), q (quit)",
+        help="on a terminal, redraw every SECS seconds; keys a (--all), d (--details), w (waiters), l (log), q (quit)",
     )
     cli.add_argument(
         "--color",
