@@ -394,9 +394,12 @@ def test_stm_rows_come_first_under_stm_and_the_note_stays_without(world, capsys)
 
     bh.print_rows(bh.parser().parse_args(["--stm", "--plain", *where]))
     lines = capsys.readouterr().out.splitlines()
-    assert lines[2].startswith("stm   long    ") and lines[2].endswith("(frame_1)  +1 waiting")
-    assert lines[3] == "" and [line[:4] for line in lines[4:]] == ["2.21", "2.22"]
-    assert lines[5].endswith("(frame_1[1])  waiting on stm")
+    assert lines[:3] == ["Unavailable Boards", f"stm  {ME} (frame_1)", ""]
+    assert [line[:4] for line in lines[3:]] == ["2.21", "2.22"] and lines[4].endswith("(frame_1[1])  waiting on stm")
+
+    bh.print_rows(bh.parser().parse_args(["--stm", "--no-header", "--color", "always", *where]))
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[:2] == [bh.DIM + f"stm  {ME} (frame_1)" + bh.RESET, ""] and lines[2].startswith("2.21")
 
     bh.print_rows(bh.parser().parse_args(["--stm", "--details", *where]))
     lines = capsys.readouterr().out.splitlines()
@@ -412,16 +415,21 @@ def test_stm_rows_come_first_under_stm_and_the_note_stays_without(world, capsys)
     assert [line[:4] for line in lines[2:]] == ["2.21", "2.22"] and lines[3].endswith("waiting on stm")
 
 
-def test_free_and_missing_stm_rows_show_only_under_all(world, capsys):
+def test_the_stm_line_names_hidden_and_under_all_free_and_missing(world, capsys):
     stm = stm_world(world)
     where = ["--config-root", str(world.root), "--locks-dir", str(world.locks)]
     bh.print_rows(bh.parser().parse_args(["--stm", *where]))
     assert capsys.readouterr().out == "Unavailable Boards\n\nNo unavailable boards.\n"
     bh.print_rows(bh.parser().parse_args(["--stm", "--all", *where]))
-    assert capsys.readouterr().out.splitlines()[2:4] == ["stm   ○ frame_1", ""]
+    assert capsys.readouterr().out.splitlines()[:3] == ["Board Status", "stm  free (frame_1)", ""]
+    write_locks(world, (stm, 777, False))
+    bh.print_rows(bh.parser().parse_args(["--stm", "--color", "always", *where]))
+    out = capsys.readouterr().out
+    assert out.splitlines()[1] == bh.DIM + "stm  hidden (frame_1)" + bh.RESET and bh.ACCENT not in out
+    (world.proc / "locks").unlink()
     stm.unlink()
     bh.print_rows(bh.parser().parse_args(["--stm", "--all", "--plain", *where]))
-    assert capsys.readouterr().out.splitlines()[2:4] == ["stm   missing frame_1 (no STM_192_0_2_2.lock)", ""]
+    assert capsys.readouterr().out.splitlines()[:3] == ["Board Status", "stm  missing (frame_1)", ""]
 
 
 def test_output_without_stm_lock_files_is_unchanged(world, capsys):

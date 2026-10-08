@@ -522,31 +522,43 @@ def with_stm(data, stm):
     return [replace(row, frame_stm=stm) for row in data]
 
 
-def test_s_shows_stm_rows_above_the_boards_and_cuts_them_last():
+def test_s_puts_one_dim_stm_line_under_the_header_and_keeps_it():
     view = bh.LiveView(bh.parser().parse_args(["-n", "1", "--plain"]), "nowhere")
     stm = stm_row(holder("500", user="alice", script="probe.py", age=3600), [holder("600", user="bob")])
     data = with_stm(snapshot(b21=holder("500"), b22=holder("600"), b23=holder("700")), stm)
     data[1] = replace(data[1], waiting_on_stm=True)
     hidden = view.screen(data, 0.0, False)
-    assert [line[:4] for line in hidden[2:5]] == ["2.21", "2.22", "2.23"] and hidden[5] == ""
-    assert hidden[3].endswith("(frame_1[1])  waiting on stm")
+    header, r21, r22, r23, footer = hidden[0], *hidden[2:5], hidden[-1]
+    assert hidden == [header, "", r21, r22, r23, "", footer]
+    assert [line[:4] for line in (r21, r22, r23)] == ["2.21", "2.22", "2.23"]
+    assert r22.endswith("(frame_1[1])  waiting on stm")
     assert not view.key("s")
-    full = view.screen(data, 0.0, False)
-    header, footer = full[0], full[-1]
     assert footer == "every 1s  a all  d details  w waiting  s stm  l log  q quit"
-    s, r21, r22, r23 = full[2], full[4], full[5], full[6]
-    assert s.startswith("stm   long    alice") and s.endswith("(frame_1)  +1 waiting")
-    assert full == [header, "", s, "", *hidden[2:5], "", footer]
+    line = "stm  alice (frame_1)"
+    assert view.screen(data, 0.0, False) == [header, line, "", r21, r22, r23, "", footer]
+    assert view.screen(data, 0.0, True)[1] == bh.DIM + line + bh.RESET
+    # `w` folds out board waiters only; the STM's waiters stay in --details.
     view.key("w")
-    w = view.screen(data, 0.0, False)[3]
-    assert w.split()[:2] == ["waiting", "bob"]
-    assert view.screen(data, 0.0, False) == [header, "", s, w, "", r21, r22, r23, "", footer]
-    assert view.screen(data, 0.0, False, height=9) == [header, "", s, "", r21, r22, r23, "", footer]
-    assert view.screen(data, 0.0, False, height=7) == [header, "", s, "", r21, "", footer]
-    assert view.screen(data, 0.0, False, height=5) == [header, "", s, "", footer]
+    assert view.screen(data, 0.0, False) == [header, line, "", r21, r22, r23, "", footer]
+    assert view.screen(data, 0.0, False, height=7) == [header, line, "", r21, r22, "", footer]
+    assert view.screen(data, 0.0, False, height=6) == [header, line, "", r21, "", footer]
     for height in range(1, 12):
         lines = view.screen(data, 0.0, False, height=height)
         assert len(lines) <= height and lines[-1] == footer, height
+    frame_2 = bh.Board(ip="192.0.2.4", machine="frame_2", is_stm=True)
+    other = replace(stm_row(holder("800", user="carol")), board=frame_2)
+    two = [replace(bh.Row(bh.Board(ip="192.0.2.5", machine="frame_2"), Path("x"), None, True), frame_stm=other), *data]
+    assert view.screen(two, 0.0, False)[1] == "stm  alice (frame_1)  carol (frame_2)"
+    gone = with_stm(data, stm_row(holder("777", alive=False)))
+    assert view.screen(gone, 0.0, True)[1] == bh.DIM + "stm  hidden (frame_1)" + bh.RESET
+    free = with_stm(data, stm_row())
+    assert view.screen(free, 0.0, False)[1:3] == ["", r21]
+    view.key("a")
+    assert view.screen(free, 0.0, False)[1] == "stm  free (frame_1)"
+    view.key("d")
+    details = view.screen(data, 0.0, False)
+    assert details[1] == "" and details[2].startswith("STM 192.0.2.2   (STM_192_0_2_2.lock): locked by alice")
+    assert details[3] == "    waiting: bob (PID=600, CMD=run.py) for 1m 00s"
 
 
 def test_change_log_notes_stm_changes_only_under_s():

@@ -585,7 +585,7 @@ def use_color(plain: bool, stream=None, mode: str = "auto") -> bool:
 
 
 def compact(row: Row, full_ip: bool, show_pid: bool, plain: bool, mark: str = " ", color: bool = False) -> str:
-    label = "stm" if row.board.is_stm else (row.board.ip if full_ip else ip_suffix(row.board.ip))
+    label = row.board.ip if full_ip else ip_suffix(row.board.ip)
     label_width = 15 if full_ip else 5
     symbol_width = STATE_WIDTH if plain else SYMBOL_WIDTH
     symbol = f"{status_symbol(row.state, plain):<{symbol_width}}"
@@ -780,26 +780,40 @@ def sources(args: argparse.Namespace) -> tuple[Path, Path]:
     return config_root, args.locks_dir or config_root / LOCKS_DIR
 
 
+def stm_line(args: argparse.Namespace, data: list[Row], color: bool) -> str | None:
+    """Under --stm, one dim line naming who holds each frame's STM lock, in address order: `stm`, then each holder and
+    its frame, and under --all a free or missing one by its state. None under --details, which lists the STM locks in
+    full, and when none is left to show."""
+    if not args.stm or args.details:
+        return None
+    shown = [row for row in stm_rows(data) if is_visible(row, args.all)]
+    if not shown:
+        return None
+    cells = ["stm"]
+    for row in shown:
+        who = row.state if row.holder is None else ("hidden" if row.holder.hidden else row.holder.user)
+        cells.append(f"{who} ({row.board.label})")
+    return paint("  ".join(cells), DIM, color)
+
+
 def frame_lines(
     args: argparse.Namespace, data: list[Row], color: bool, where: str, title: bool = True, waiters: int = 0
 ) -> list[str]:
-    """The text a static run prints, line by line; the live view takes it without the title and, under its `w` key,
-    with up to `waiters` waiter lines, the STM rows' first. Under --stm each frame's STM row comes before the boards,
-    then a blank line."""
+    """The text a static run prints, line by line; the live view takes it without the title, which carries the STM
+    line, and, under its `w` key, with up to `waiters` waiter lines. Under --stm --details each frame's STM lock comes
+    in full before the boards, then a blank line."""
     visible = [row for row in data if is_visible(row, args.all)]
     lines: list[str] = []
     if title and not args.no_header:
-        lines += [paint("Board Status" if args.all else "Unavailable Boards", BOLD, color), ""]
+        lines.append(paint("Board Status" if args.all else "Unavailable Boards", BOLD, color))
+    if title and (stm := stm_line(args, data, color)):
+        lines.append(stm)
+    if lines:
+        lines.append("")
 
-    stms = [row for row in stm_rows(data) if is_visible(row, args.all)] if args.stm else []
+    stms = [row for row in stm_rows(data) if is_visible(row, args.all)] if args.stm and args.details else []
     if stms:
-        if args.details:
-            lines += [line for row in stms for line in detailed(row).split("\n")]
-        else:
-            lines += compact_lines(
-                stms, full_ip=args.full_ip, show_pid=args.pid, plain=args.plain, color=color, waiters=waiters
-            )
-        waiters -= sum(len(row.waiters) for row in stms)
+        lines += [line for row in stms for line in detailed(row).split("\n")]
         lines.append("")
 
     if not data:
@@ -966,15 +980,18 @@ class LiveView:
         self.seen = current
 
     def screen(self, data: list[Row], now: float, color: bool, height: int | None = None) -> list[str]:
-        """Header, rows, change log and footer, each after a blank line. Given a height, the frame fits it: the change
-        log is cut first, oldest entry first, then the waiter lines from the last board up, the STM rows' waiters last, then
-        the rows from the bottom, the STM rows last; the header and footer stay."""
-        waiters = sum(len(row.waiters) for row in [*data, *stm_rows(data)]) if self.waiting else 0
+        """Header, rows, change log and footer, each after a blank line; under `s` the STM line sits directly under the
+        header. Given a height, the frame fits it: the change log is cut first, oldest entry first, then the waiter
+        lines from the last board up, then the rows from the bottom; the header, its STM line and the footer stay."""
+        head = [live_header(data, now, color)]
+        if stm := stm_line(self.args, data, color):
+            head.append(stm)
+        waiters = sum(len(row.waiters) for row in data) if self.waiting else 0
         body = frame_lines(self.args, data, color, self.where, title=False, waiters=waiters)
         log = [paint(change, DIM, color) for change in self.changes] if self.log else []
         if height is not None:
-            # Four lines go to the header, the footer and the blank line under and over each.
-            room = height - 4
+            # The rest goes to the header block, the footer and the blank line under and over each.
+            room = height - len(head) - 3
             shown = len(body) - len(frame_lines(self.args, data, color, self.where, title=False)) if waiters else 0
             if len(body) > room and shown:
                 body = frame_lines(
@@ -987,7 +1004,7 @@ class LiveView:
             # The log needs a blank line above it as well.
             keep = min(max(room - len(body) - 1, 0), len(log))
             log = log[len(log) - keep :]
-        lines = [live_header(data, now, color), "", *body]
+        lines = [*head, "", *body]
         if log:
             lines += ["", *log]
         footer = live_footer(
@@ -1078,7 +1095,7 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--all", action="store_true", help="show free and missing boards too")
     cli.add_argument("--config-only", action="store_true", help="hide unconfigured lock files")
     cli.add_argument("--details", action="store_true", help="show lock file, PID, command, and age")
-    cli.add_argument("--stm", action="store_true", help="show each frame's STM lock above the boards")
+    cli.add_argument("--stm", action="store_true", help="name each frame's STM lock holder under the title")
     cli.add_argument("--full-ip", action="store_true", help="show full IPs")
     cli.add_argument("--pid", action="store_true", help="show PIDs in compact output")
     cli.add_argument("--plain", action="store_true", help="print states as words: free, short, medium, long, missing")

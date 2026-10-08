@@ -63,23 +63,24 @@ With `w` on, each waiter gets a dim line under its holder's row, `↳` in the do
 
 The `+N waiting` note stays on the row. `w` belongs to the live view alone, since `--details` lists waiters too, and in the details view it changes nothing. Waiters are listed as `/proc/locks` lists them, which implies no order.
 
-The header names the time of the last redraw and counts free boards out of all boards per network-config `type` (`248` reads `spinn48`, `201` reads `spinn1`); a board whose holder exited counts as taken, one without a lock file as not free. Under the rows, dim, are the last two changes the view saw: a board taken, freed (with how long it was held), handed over between two refreshes (one line, `2.21 alice pytest -> bob run_tier.sh (held 42m 10s)`), or its holder exited while the lock stays held (`2.24 holder pid 2373047 exited, lock held (alice pytest)`; a holder found by its descriptor reads `let go` instead of `exited`). A hidden holder reads `hidden pid 2373047` in freed and handover lines. A hold already running when the view starts dates from its process's start, as the age column does. The log lives only while the view runs and continues recording while hidden. While `s` is on it logs a frame's STM lock in the same forms, named `stm frame_1` (`stm frame_1 alice pytest -> bob run_tier.sh (held 4m 32s)`); while `s` is off STM changes are not logged. The footer names the refresh interval and the keys. When the terminal is too short, the change log is cut first, then the waiter lines from the last board up, the STM rows' waiters last, then the rows from the bottom, the STM rows last, and the header and footer stay; long lines are clipped at its width.
+The header names the time of the last redraw and counts free boards out of all boards per network-config `type` (`248` reads `spinn48`, `201` reads `spinn1`); a board whose holder exited counts as taken, one without a lock file as not free. Under the rows, dim, are the last two changes the view saw: a board taken, freed (with how long it was held), handed over between two refreshes (one line, `2.21 alice pytest -> bob run_tier.sh (held 42m 10s)`), or its holder exited while the lock stays held (`2.24 holder pid 2373047 exited, lock held (alice pytest)`; a holder found by its descriptor reads `let go` instead of `exited`). A hidden holder reads `hidden pid 2373047` in freed and handover lines. A hold already running when the view starts dates from its process's start, as the age column does. The log lives only while the view runs and continues recording while hidden. While `s` is on it logs a frame's STM lock in the same forms, named `stm frame_1` (`stm frame_1 alice pytest -> bob run_tier.sh (held 4m 32s)`); while `s` is off STM changes are not logged. The footer names the refresh interval and the keys. When the terminal is too short, the change log is cut first, then the waiter lines from the last board up, then the rows from the bottom, and the header, its STM line and the footer stay; long lines are clipped at its width.
 
 ## Frame STM locks
 
-Loading a board through a frame's STM controller takes a second lock, `STM_<ip>.lock` beside the board locks, for the frame's `STM_IP` in the network config. `--stm` (`s` in the live view) shows one row per frame STM above the board rows, in address order, then a blank line. An STM row has a board row's columns, notes and visibility: a free or missing one shows only under `--all`, a held one names its holder, `+N waiting` counts the processes blocked on it, and `w` folds them out:
+Loading a board through a frame's STM controller takes a second lock, `STM_<ip>.lock` beside the board locks, for the frame's `STM_IP` in the network config. `--stm` (`s` in the live view) adds one dim line directly under the title, or under the live view's header line, or first under `--no-header`: `stm`, then the holder of each frame's STM lock and its frame, in address order. A holder no descriptor this reader can read accounts for reads `hidden`. Under `--all` free and missing STM locks join the line as `free (frame_2)` and `missing (frame_2)`; with nothing to show the line is left out. In the live view the line stays with the header when the terminal is short.
 
 ```text
-stm   ● alice        2m 42s     stm_boot_probe. (frame_1)  +1 waiting
-      ↳ bob          1h 24m     run_pytest_scri
+Unavailable Boards
+stm  alice (frame_1)  carol (frame_2)
 
+2.5   ● carol        4m 32s     multichip_reduc (frame_2)
 2.21  ● bob          1h 24m     run_pytest_scri (frame_1[0])  waiting on stm
 2.27  ● alice        2m 42s     stm_boot_probe. (frame_1[6])
 ```
 
-A board row whose holder is blocked on its own frame's STM lock gets the note `waiting on stm`, with or without `--stm`; `--plain` prints the same words and `--details` ends the board's line with `, waiting on stm`. The match is by the PIDs `/proc/locks` records: a PID that holds the board's lock and waits on the STM lock. A script that waits for the STM lock through a helper such as `flock` waits under the helper's PID, so its board row gets no note, while the STM row's waiters still list the helper.
+A board row whose holder is blocked on its own frame's STM lock gets the note `waiting on stm`, with or without `--stm`; `--plain` prints the same words and `--details` ends the board's line with `, waiting on stm`. The match is by the PIDs `/proc/locks` records: a PID that holds the board's lock and waits on the STM lock. A script that waits for the STM lock through a helper such as `flock` waits under the helper's PID, so its board row gets no note, while `--details --stm` still lists the helper among the STM's waiters.
 
-`--details --stm` lists each STM first:
+`--details --stm` lists each STM lock in full ahead of the boards, with its waiters, in place of the `stm` line:
 
 ```text
 STM 192.0.2.2   (STM_192_0_2_2.lock): locked by alice (PID=1234, CMD=stm_boot_probe.py) for 2m 42s
@@ -104,7 +105,7 @@ Common checks:
 boardhog                         # locked boards only
 boardhog --all                   # include free and missing boards
 boardhog --details               # lock file, PID, command, age
-boardhog --stm                   # frame STM locks above the boards
+boardhog --stm                   # frame STM lock holders under the title
 boardhog -n 1                    # live view, redrawn every second
 ```
 
