@@ -192,18 +192,19 @@ def test_key_hints_show_which_toggles_are_on():
         return bh.BOLD + text + bh.RESET
 
     assert hints(False, False) == "  ".join(
-        [dim("a all"), dim("d details"), dim("w waiting"), bold("l log"), dim("q quit")]
+        [dim("a all"), dim("d details"), dim("w waiting"), dim("s stm"), bold("l log"), dim("q quit")]
     )
     assert hints(True, False) == "  ".join(
-        [bold("a all"), dim("d details"), dim("w waiting"), bold("l log"), dim("q quit")]
+        [bold("a all"), dim("d details"), dim("w waiting"), dim("s stm"), bold("l log"), dim("q quit")]
     )
     assert hints(True, True) == "  ".join(
-        [bold("a all"), bold("d details"), dim("w waiting"), bold("l log"), dim("q quit")]
+        [bold("a all"), bold("d details"), dim("w waiting"), dim("s stm"), bold("l log"), dim("q quit")]
     )
     assert bh.live_footer(1.0, True, waiting=True).endswith(
-        bold("w waiting") + "  " + bold("l log") + "  " + dim("q quit")
+        bold("w waiting") + "  " + dim("s stm") + "  " + bold("l log") + "  " + dim("q quit")
     )
-    assert bh.live_footer(1.0, False, True, True, True) == "every 1s  a all  d details  w waiting  l log  q quit"
+    assert bh.live_footer(1.0, True, stm=True).endswith(bold("s stm") + "  " + bold("l log") + "  " + dim("q quit"))
+    assert bh.live_footer(1.0, False, True, True, True) == "every 1s  a all  d details  w waiting  s stm  l log  q quit"
     view = bh.LiveView(bh.parser().parse_args(["-n", "1", "--details"]), "nowhere")
     assert bh.BOLD + "d details" in view.screen([], 0.0, True)[-1]
     view.key("d")
@@ -213,13 +214,16 @@ def test_key_hints_show_which_toggles_are_on():
     assert bh.BOLD + "w waiting" in view.screen([], 0.0, True)[-1]
     view.key("l")
     assert bh.DIM + "l log" in view.screen([], 0.0, True)[-1]
+    assert bh.DIM + "s stm" in view.screen([], 0.0, True)[-1]
+    assert not view.key("s")
+    assert bh.BOLD + "s stm" in view.screen([], 0.0, True)[-1]
 
 
 def test_a_short_window_cuts_the_change_log_then_rows_and_keeps_the_footer():
     view = bh.LiveView(bh.parser().parse_args(["-n", "1", "--all", "--plain"]), "nowhere")
     data = snapshot(b21=holder("500"), b22=holder("501"), b23=holder("502"))
     view.changes.extend(["12:00:00  2.21 taken by alice run.py", "12:00:01  2.22 taken by alice run.py"])
-    footer = "every 1s  a all  d details  w waiting  l log  q quit"
+    footer = "every 1s  a all  d details  w waiting  s stm  l log  q quit"
     full = view.screen(data, 0.0, False)
     header, rows, changes = full[0], full[2:5], full[6:8]
     assert full == [header, "", *rows, "", *changes, "", footer]
@@ -423,7 +427,7 @@ def test_one_frame_keys_and_draw(world):
     lines = view.screen(data, now, False)
     assert lines[0] == f"boardhog  {clock(now)}  spinn48 2/3 free  spinn1 1/1 free"
     assert lines[1] == "" and [line.split()[0] for line in lines[2:-2]] == ["2.22"]
-    assert lines[-2:] == ["", "every 60s  a all  d details  w waiting  l log  q quit"]
+    assert lines[-2:] == ["", "every 60s  a all  d details  w waiting  s stm  l log  q quit"]
     assert not view.key("a") and view.screen(data, now, False)[-3] == "free  2.21 2.23 100.2"
     assert not view.key("d") and view.screen(data, now, False)[2].startswith(
         "192.0.2.21      (BOARD_192_0_2_21.lock): free"
@@ -505,3 +509,57 @@ def test_watch_without_a_terminal_prints_one_static_frame(world, capsys, monkeyp
     bh.main()
     assert capsys.readouterr().out == static
     assert static.startswith("Unavailable Boards\n\n2.22")
+
+
+def stm_row(held=None, waiters=()):
+    """frame_1's STM row at 192.0.2.2."""
+    board = bh.Board(ip="192.0.2.2", machine="frame_1", is_stm=True)
+    return bh.Row(board, Path("x"), held, True, tuple(waiters))
+
+
+def with_stm(data, stm):
+    """The rows of `data` with `stm` as their frame's STM row."""
+    return [replace(row, frame_stm=stm) for row in data]
+
+
+def test_s_shows_stm_rows_above_the_boards_and_cuts_them_last():
+    view = bh.LiveView(bh.parser().parse_args(["-n", "1", "--plain"]), "nowhere")
+    stm = stm_row(holder("500", user="alice", script="probe.py", age=3600), [holder("600", user="bob")])
+    data = with_stm(snapshot(b21=holder("500"), b22=holder("600"), b23=holder("700")), stm)
+    data[1] = replace(data[1], waiting_on_stm=True)
+    hidden = view.screen(data, 0.0, False)
+    assert [line[:4] for line in hidden[2:5]] == ["2.21", "2.22", "2.23"] and hidden[5] == ""
+    assert hidden[3].endswith("(frame_1[1])  waiting on stm")
+    assert not view.key("s")
+    full = view.screen(data, 0.0, False)
+    header, footer = full[0], full[-1]
+    assert footer == "every 1s  a all  d details  w waiting  s stm  l log  q quit"
+    s, r21, r22, r23 = full[2], full[4], full[5], full[6]
+    assert s.startswith("stm   long    alice") and s.endswith("(frame_1)  +1 waiting")
+    assert full == [header, "", s, "", *hidden[2:5], "", footer]
+    view.key("w")
+    w = view.screen(data, 0.0, False)[3]
+    assert w.split()[:2] == ["waiting", "bob"]
+    assert view.screen(data, 0.0, False) == [header, "", s, w, "", r21, r22, r23, "", footer]
+    assert view.screen(data, 0.0, False, height=9) == [header, "", s, "", r21, r22, r23, "", footer]
+    assert view.screen(data, 0.0, False, height=7) == [header, "", s, "", r21, "", footer]
+    assert view.screen(data, 0.0, False, height=5) == [header, "", s, "", footer]
+    for height in range(1, 12):
+        lines = view.screen(data, 0.0, False, height=height)
+        assert len(lines) <= height and lines[-1] == footer, height
+
+
+def test_change_log_notes_stm_changes_only_under_s():
+    view = bh.LiveView(bh.parser().parse_args(["-n", "1"]), "nowhere")
+    start = time.time()
+    board = snapshot()
+    view.update(with_stm(board, stm_row(holder("500", user="alice", script="multichip_reduce"))), start)
+    view.update(with_stm(board, stm_row(holder("600", user="bob", script="stm_boot_probe.py"))), start + 10)
+    assert list(view.changes) == []
+    view.key("s")
+    view.update(with_stm(board, stm_row(holder("700", user="carol", script="pytest"))), start + 15)
+    view.update(with_stm(board, stm_row()), start + 20)
+    assert list(view.changes) == [
+        f"{clock(start + 15)}  stm frame_1 bob stm_boot_probe.py -> carol pytest (held 5s)",
+        f"{clock(start + 20)}  stm frame_1 freed (carol pytest, held 5s)",
+    ]

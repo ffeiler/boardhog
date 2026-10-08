@@ -4,6 +4,7 @@ Each test that touches /proc writes /proc/locks and /proc/<pid> files under tmp_
 IPs are RFC 5737 documentation addresses (192.0.2.0/24, 198.51.100.0/24), not real boards.
 """
 
+import json
 import os
 import pwd
 import time
@@ -22,6 +23,9 @@ frame_1:
   ETH_IP_START: 192.0.2.21
 """
 ME = pwd.getpwuid(os.getuid()).pw_name
+# frame_1 under an STM controller, and a machine whose STM_IP is None.
+STM_CONFIG = CONFIG + "  STM_IP: 192.0.2.2\n"
+NO_STM = "\nb201_1:\n  type: 201\n  ETH_IP_START: 198.51.100.2\n  STM_IP: None\n"
 
 
 @pytest.fixture
@@ -47,11 +51,12 @@ def dev_inode(path):
 
 
 def write_locks(world, *entries):
-    """One /proc/locks line per (board's last octet, pid, waiting) entry."""
+    """One /proc/locks line per (board's last octet or lock path, pid, waiting) entry."""
     lines = []
     for number, (last, pid, waiting) in enumerate(entries, 1):
         arrow = "-> " if waiting else ""
-        lines.append(f"{number}: {arrow}FLOCK  ADVISORY  WRITE {pid} {dev_inode(lock_file(world, last))} 0 EOF")
+        path = last if isinstance(last, Path) else lock_file(world, last)
+        lines.append(f"{number}: {arrow}FLOCK  ADVISORY  WRITE {pid} {dev_inode(path)} 0 EOF")
     (world.proc / "locks").write_text("\n".join(lines) + "\n")
 
 
@@ -320,3 +325,123 @@ def test_accent_marks_dead_and_long_holds_only():
     assert dead.count(bh.ACCENT) == 2 and dead.endswith(bh.ACCENT + "pid 777 exited, lock held" + bh.RESET)
     for row in (long_row, short_row, dead_row):
         assert "\x1b" not in bh.compact(row, False, False, False)
+
+
+def stm_world(world):
+    """frame_1 under the STM controller 192.0.2.2, whose lock file is in place, and a machine without one."""
+    (world.root / bh.NETWORK_CONFIG).write_text(STM_CONFIG + NO_STM)
+    stm = world.locks / "STM_192_0_2_2.lock"
+    stm.touch()
+    return stm
+
+
+def test_a_board_holder_blocked_on_its_frames_stm_is_tagged(world):
+    stm = stm_world(world)
+    add_process(world, 500, ["python", "stm_boot_probe.py"])
+    add_process(world, 600, ["python", "run_pytest_script.py"])
+    write_locks(world, (21, 500, False), (stm, 500, False), (22, 600, False), (stm, 600, True))
+    data = board_rows(world)
+    r21, r22, r23 = (data[f"192.0.2.{last}"] for last in (21, 22, 23))
+    assert r21.frame_stm is r22.frame_stm is r23.frame_stm
+    assert (r21.frame_stm.board.lock_name, r21.frame_stm.holder.pid) == ("STM_192_0_2_2.lock", "500")
+    assert [waiter.pid for waiter in r21.frame_stm.waiters] == ["600"]
+    assert (r21.waiting_on_stm, r22.waiting_on_stm, r23.waiting_on_stm) == (False, True, False)
+    assert data["198.51.100.2"].frame_stm is None
+    assert [bh.stm_address(value) for value in ("192.0.2.2", "None", "", None, "2001:db8::2")] == [
+        "192.0.2.2",
+        None,
+        None,
+        None,
+        None,
+    ]
+    assert bh.compact(r22, full_ip=False, show_pid=False, plain=True).endswith("(frame_1[1])  waiting on stm")
+    assert bh.detailed(r22) == (
+        f"192.0.2.22      (BOARD_192_0_2_22.lock): locked by {ME} (PID=600, CMD=run_pytest_script.py)"
+        " for unknown, waiting on stm"
+    )
+
+
+def test_json_carries_the_frames_stm_and_stays_a_list_of_boards(world, capsys):
+    stm = stm_world(world)
+    add_process(world, 500, ["python", "probe.py"])
+    add_process(world, 600, ["python", "run.py"])
+    write_locks(world, (stm, 500, False), (22, 600, False), (stm, 600, True))
+    data = board_rows(world)
+    blob = bh.as_json(data["192.0.2.22"])
+    assert blob["waiting_on_stm"] is True
+    assert {key: blob["stm"][key] for key in ("lock_name", "lock_path", "lock_file_exists", "state")} == {
+        "lock_name": "STM_192_0_2_2.lock",
+        "lock_path": str(stm),
+        "lock_file_exists": True,
+        "state": "long",
+    }
+    assert set(blob["stm"]) == {"lock_name", "lock_path", "lock_file_exists", "state", "holder", "waiters"}
+    assert blob["stm"]["holder"]["pid"] == "500" and [waiter["pid"] for waiter in blob["stm"]["waiters"]] == ["600"]
+    free = bh.as_json(data["192.0.2.21"])
+    assert free["waiting_on_stm"] is False and free["stm"] == blob["stm"]
+    assert bh.as_json(data["198.51.100.2"])["stm"] is None
+    where = ["--config-root", str(world.root), "--locks-dir", str(world.locks)]
+    bh.print_rows(bh.parser().parse_args(["--json", "--stm", *where]))
+    assert [board["ip"] for board in json.loads(capsys.readouterr().out)] == ["192.0.2.22"]
+
+
+def test_stm_rows_come_first_under_stm_and_the_note_stays_without(world, capsys):
+    stm = stm_world(world)
+    add_process(world, 500, ["python", "probe.py"])
+    add_process(world, 600, ["python", "run.py"])
+    write_locks(world, (stm, 500, False), (21, 500, False), (22, 600, False), (stm, 600, True))
+    where = ["--config-root", str(world.root), "--locks-dir", str(world.locks)]
+
+    bh.print_rows(bh.parser().parse_args(["--stm", "--plain", *where]))
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[2].startswith("stm   long    ") and lines[2].endswith("(frame_1)  +1 waiting")
+    assert lines[3] == "" and [line[:4] for line in lines[4:]] == ["2.21", "2.22"]
+    assert lines[5].endswith("(frame_1[1])  waiting on stm")
+
+    bh.print_rows(bh.parser().parse_args(["--stm", "--details", *where]))
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[2:5] == [
+        f"STM 192.0.2.2   (STM_192_0_2_2.lock): locked by {ME} (PID=500, CMD=probe.py) for unknown",
+        f"    waiting: {ME} (PID=600, CMD=run.py) for unknown",
+        "",
+    ]
+    assert lines[6].endswith(", waiting on stm")
+
+    bh.print_rows(bh.parser().parse_args(["--plain", *where]))
+    lines = capsys.readouterr().out.splitlines()
+    assert [line[:4] for line in lines[2:]] == ["2.21", "2.22"] and lines[3].endswith("waiting on stm")
+
+
+def test_free_and_missing_stm_rows_show_only_under_all(world, capsys):
+    stm = stm_world(world)
+    where = ["--config-root", str(world.root), "--locks-dir", str(world.locks)]
+    bh.print_rows(bh.parser().parse_args(["--stm", *where]))
+    assert capsys.readouterr().out == "Unavailable Boards\n\nNo unavailable boards.\n"
+    bh.print_rows(bh.parser().parse_args(["--stm", "--all", *where]))
+    assert capsys.readouterr().out.splitlines()[2:4] == ["stm   ○ frame_1", ""]
+    stm.unlink()
+    bh.print_rows(bh.parser().parse_args(["--stm", "--all", "--plain", *where]))
+    assert capsys.readouterr().out.splitlines()[2:4] == ["stm   missing frame_1 (no STM_192_0_2_2.lock)", ""]
+
+
+def test_output_without_stm_lock_files_is_unchanged(world, capsys):
+    add_process(world, 500, ["python", "run.py"])
+    add_process(world, 501, ["flock", "9"], comm="flock")
+    write_locks(world, (22, 500, False), (22, 501, True))
+    where = ["--config-root", str(world.root), "--locks-dir", str(world.locks)]
+    flag_sets = ([], ["--all"], ["--all", "--plain"], ["--details"], ["--pid", "--full-ip"])
+
+    def outputs(*extra):
+        found = []
+        for flags in flag_sets:
+            bh.print_rows(bh.parser().parse_args([*flags, *extra, *where]))
+            found.append(capsys.readouterr().out)
+        return found
+
+    before = outputs()
+    (world.root / bh.NETWORK_CONFIG).write_text(STM_CONFIG)
+    assert outputs() == before
+    # Under --stm a missing STM lock file shows only with --all, so the views without it stay the same.
+    assert [out for flags, out in zip(flag_sets, outputs("--stm")) if "--all" not in flags] == [
+        out for flags, out in zip(flag_sets, before) if "--all" not in flags
+    ]

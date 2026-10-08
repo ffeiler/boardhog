@@ -29,6 +29,7 @@ DEFAULT_CONFIG_ROOT = Path("/mnt/spinnaker")
 NETWORK_CONFIG = "spinnaker2_network_config.yml"
 LOCKS_DIR = "locks"
 LOCK_PREFIX = "BOARD_"
+STM_PREFIX = "STM_"
 LOCK_SUFFIX = ".lock"
 
 BOARD_TYPES = {
@@ -62,7 +63,7 @@ HOME = "\x1b[H"
 CLEAR_LINE = "\x1b[K"
 CLEAR_BELOW = "\x1b[J"
 # Key hints: a hint whose toggle is on shows bold, the rest dim.
-LIVE_KEYS = (("a", "all"), ("d", "details"), ("w", "waiting"), ("l", "log"), ("q", "quit"))
+LIVE_KEYS = (("a", "all"), ("d", "details"), ("w", "waiting"), ("s", "stm"), ("l", "log"), ("q", "quit"))
 CHANGE_LOG_LINES = 2
 # Header names per network-config board type; another type shows as its raw value.
 TYPE_NAMES = {"248": "spinn48", "201": "spinn1"}
@@ -86,10 +87,15 @@ class Board:
     board_type: str | None = None
     n_boards: int = 1
     configured: bool = True
+    # The address of the STM controller that manages the board's frame, None for a machine without one.
+    stm_ip: str | None = None
+    # A frame's STM controller in place of a board: `ip` is its address and its lock file is STM_<ip>.lock.
+    is_stm: bool = False
 
     @property
     def lock_name(self) -> str:
-        return f"{LOCK_PREFIX}{self.ip.replace('.', '_')}{LOCK_SUFFIX}"
+        prefix = STM_PREFIX if self.is_stm else LOCK_PREFIX
+        return f"{prefix}{self.ip.replace('.', '_')}{LOCK_SUFFIX}"
 
     @property
     def label(self) -> str:
@@ -138,6 +144,10 @@ class Row:
     lock_file_exists: bool
     waiters: tuple[Holder, ...] = ()
     lock_mtime: float | None = None
+    # The row of the frame's STM lock, one object shared by every board of the frame; None for a machine without one.
+    frame_stm: Row | None = None
+    # A PID that holds this board's lock is blocked on its frame's STM lock.
+    waiting_on_stm: bool = False
 
     @property
     def state(self) -> str:
@@ -205,6 +215,7 @@ def configured_boards(config_root: Path) -> list[Board]:
         except ValueError:
             continue
 
+        stm_ip = stm_address(data.get("STM_IP"))
         for board_id in range(n_boards):
             boards.append(
                 Board(
@@ -213,10 +224,19 @@ def configured_boards(config_root: Path) -> list[Board]:
                     board_id=board_id,
                     board_type=data.get("type"),
                     n_boards=n_boards,
+                    stm_ip=stm_ip,
                 )
             )
 
     return boards
+
+
+def stm_address(value: str | None) -> str | None:
+    """A frame's STM_IP as an IPv4 address; a machine without one, or with `STM_IP: None`, gets None."""
+    try:
+        return str(ipaddress.IPv4Address(value)) if value else None
+    except ValueError:
+        return None
 
 
 def inventory(config_root: Path, locks_dir: Path, include_unconfigured: bool) -> list[Board]:
@@ -308,29 +328,48 @@ def rows(config_root: Path, locks_dir: Path, include_unconfigured: bool) -> list
     locks = proc_locks()
     boot = boot_time()
     boards = inventory(config_root, locks_dir, include_unconfigured)
-    entries: dict[str, LockPids | None] = {}
+    # Each frame's STM controller once by address, named after its first board.
+    controllers: dict[str, Board] = {}
     for board in boards:
+        if board.stm_ip:
+            controllers.setdefault(board.stm_ip, Board(ip=board.stm_ip, machine=board.machine, is_stm=True))
+    locked = [*boards, *controllers.values()]
+    entries: dict[str, LockPids | None] = {}
+    for board in locked:
         key = lock_key(locks_dir / board.lock_name)
-        entries[board.ip] = locks.get(key) if key else None
+        entries[board.lock_name] = locks.get(key) if key else None
     # One pass over /proc serves every lock whose recorded holders have all exited.
     orphaned = [
         locks_dir / board.lock_name
-        for board in boards
-        if (entry := entries[board.ip]) and entry.holders and not any((PROC / pid).is_dir() for pid in entry.holders)
+        for board in locked
+        if (entry := entries[board.lock_name])
+        and entry.holders
+        and not any((PROC / pid).is_dir() for pid in entry.holders)
     ]
     fds = lock_fds(orphaned) if orphaned else {}
 
-    def resolve(board: Board) -> Row:
+    def resolve(board: Board, frame_stm: Row | None = None) -> Row:
         lock_path = locks_dir / board.lock_name
-        entry = entries[board.ip]
+        entry = entries[board.lock_name]
         mtime = lock_mtime(lock_path)
         # Only a truncating open, such as a shell's `exec 9>FILE`, moves the mtime, so one from before boot says nothing.
         opened_at = mtime if mtime is not None and boot is not None and mtime > boot else None
         held = resolve_holder(entry, lock_path, opened_at, fds) if entry else None
         waiters = tuple(holder(pid) for pid in entry.waiters) if entry else ()
-        return Row(board, lock_path, held, lock_path.exists(), waiters, mtime)
+        # /proc/locks records the PID that called flock on either file, so a PID among the board's holders and the
+        # STM's waiters is one process that holds the board and waits for the STM.
+        stm_entry = entries[frame_stm.board.lock_name] if frame_stm else None
+        waiting = bool(entry and stm_entry and set(entry.holders) & set(stm_entry.waiters))
+        return Row(board, lock_path, held, lock_path.exists(), waiters, mtime, frame_stm, waiting)
 
-    return [resolve(board) for board in boards]
+    stms = {ip: resolve(controller) for ip, controller in controllers.items()}
+    return [resolve(board, stms.get(board.stm_ip)) for board in boards]
+
+
+def stm_rows(data: list[Row]) -> list[Row]:
+    """Each frame's STM row once, in address order."""
+    found = {row.frame_stm.board.ip: row.frame_stm for row in data if row.frame_stm is not None}
+    return sorted(found.values(), key=lambda row: ip_key(row.board.ip))
 
 
 def resolve_holder(
@@ -546,7 +585,7 @@ def use_color(plain: bool, stream=None, mode: str = "auto") -> bool:
 
 
 def compact(row: Row, full_ip: bool, show_pid: bool, plain: bool, mark: str = " ", color: bool = False) -> str:
-    label = row.board.ip if full_ip else ip_suffix(row.board.ip)
+    label = "stm" if row.board.is_stm else (row.board.ip if full_ip else ip_suffix(row.board.ip))
     label_width = 15 if full_ip else 5
     symbol_width = STATE_WIDTH if plain else SYMBOL_WIDTH
     symbol = f"{status_symbol(row.state, plain):<{symbol_width}}"
@@ -563,6 +602,8 @@ def compact(row: Row, full_ip: bool, show_pid: bool, plain: bool, mark: str = " 
         line += "  " + paint(f"pid {row.holder.dead_pid} exited, lock held", ACCENT, color)
     if row.waiters:
         line += "  " + paint(f"+{len(row.waiters)} waiting", DIM, color)
+    if row.waiting_on_stm:
+        line += "  " + paint("waiting on stm", DIM, color)
     return line
 
 
@@ -641,7 +682,8 @@ def free_summary(visible: list[Row], full_ip: bool) -> str | None:
 
 
 def detailed(row: Row) -> str:
-    prefix = f"{row.board.ip:<15} ({row.board.lock_name}):"
+    label = f"STM {row.board.ip}" if row.board.is_stm else row.board.ip
+    prefix = f"{label:<15} ({row.board.lock_name}):"
     if row.state == "missing":
         return f"{prefix} missing lock file"
     if row.holder is None:
@@ -656,6 +698,8 @@ def detailed(row: Row) -> str:
         opened = "open time unknown" if clock is None else f"lock file opened {clock}"
         held_by = "lock held by no fd this reader can read"
         line = f"{prefix} locked, holder PID={held.dead_pid} exited, {held_by}, {opened}"
+    if row.waiting_on_stm:
+        line += ", waiting on stm"
     for waiter in row.waiters:
         line += (
             f"\n    waiting: {waiter.user} (PID={waiter.pid}, CMD={display_command(waiter)})"
@@ -702,6 +746,21 @@ def as_json(row: Row) -> dict[str, object]:
         "state": row.state,
         "holder": holder_json(row.holder),
         "waiters": [holder_json(waiter) for waiter in row.waiters],
+        "stm": stm_json(row.frame_stm),
+        "waiting_on_stm": row.waiting_on_stm,
+    }
+
+
+def stm_json(row: Row | None) -> dict[str, object] | None:
+    if row is None:
+        return None
+    return {
+        "lock_name": row.board.lock_name,
+        "lock_path": str(row.lock_path),
+        "lock_file_exists": row.lock_file_exists,
+        "state": row.state,
+        "holder": holder_json(row.holder),
+        "waiters": [holder_json(waiter) for waiter in row.waiters],
     }
 
 
@@ -725,11 +784,23 @@ def frame_lines(
     args: argparse.Namespace, data: list[Row], color: bool, where: str, title: bool = True, waiters: int = 0
 ) -> list[str]:
     """The text a static run prints, line by line; the live view takes it without the title and, under its `w` key,
-    with up to `waiters` waiter lines."""
+    with up to `waiters` waiter lines, the STM rows' first. Under --stm each frame's STM row comes before the boards,
+    then a blank line."""
     visible = [row for row in data if is_visible(row, args.all)]
     lines: list[str] = []
     if title and not args.no_header:
         lines += [paint("Board Status" if args.all else "Unavailable Boards", BOLD, color), ""]
+
+    stms = [row for row in stm_rows(data) if is_visible(row, args.all)] if args.stm else []
+    if stms:
+        if args.details:
+            lines += [line for row in stms for line in detailed(row).split("\n")]
+        else:
+            lines += compact_lines(
+                stms, full_ip=args.full_ip, show_pid=args.pid, plain=args.plain, color=color, waiters=waiters
+            )
+        waiters -= sum(len(row.waiters) for row in stms)
+        lines.append("")
 
     if not data:
         return lines + [f"No boards found in {where}"]
@@ -791,10 +862,16 @@ def live_header(data: list[Row], now: float, color: bool) -> str:
 
 
 def live_footer(
-    interval: float, color: bool, show_all: bool = False, details: bool = False, waiting: bool = False, log: bool = True
+    interval: float,
+    color: bool,
+    show_all: bool = False,
+    details: bool = False,
+    waiting: bool = False,
+    log: bool = True,
+    stm: bool = False,
 ) -> str:
     cells = [paint(f"every {interval:g}s", DIM, color)]
-    active = {"a": show_all, "d": details, "w": waiting, "l": log, "q": False}
+    active = {"a": show_all, "d": details, "w": waiting, "s": stm, "l": log, "q": False}
     cells += [paint(f"{key} {word}", BOLD if active[key] else DIM, color) for key, word in LIVE_KEYS]
     return "  ".join(cells)
 
@@ -826,6 +903,13 @@ def who_holds(held: Holder) -> str:
     return f"{held.user} {display_command(held)}" if held.alive else f"hidden pid {held.dead_pid}"
 
 
+def change_label(board: Board, full_ip: bool) -> str:
+    """How the change log names a board, or a frame's STM as `stm frame_1`."""
+    if board.is_stm:
+        return f"stm {board.label}"
+    return board.ip if full_ip else ip_suffix(board.ip)
+
+
 class LiveView:
     """What the live view keeps between refreshes: the flags its keys toggle, the holders it last saw, when each hold
     began, and the last changes. It lives in memory only while the view runs."""
@@ -850,37 +934,42 @@ class LiveView:
             self.args.details = not self.args.details
         elif char == "w":
             self.waiting = not self.waiting
+        elif char == "s":
+            self.args.stm = not self.args.stm
         elif char == "l":
             self.log = not self.log
         return False
 
     def update(self, data: list[Row], now: float) -> None:
-        current = {row.board.ip: row.holder for row in data}
+        # STM holds are tracked while `s` is off, so turning it on logs no stale change; only their notes wait for it.
+        tracked = {row.board.lock_name: row for row in [*data, *stm_rows(data)]}
+        current = {name: row.holder for name, row in tracked.items()}
         if self.seen is None:
             # A hold already running when the view starts dates from its process's start, as the age column does.
-            for ip, held in current.items():
+            for name, held in current.items():
                 if held is not None:
-                    self.taken_at[ip] = now - held.age_seconds if held.alive and held.age_seconds is not None else now
+                    self.taken_at[name] = now - held.age_seconds if held.alive and held.age_seconds is not None else now
             self.seen = current
             return
         clock = time.strftime("%H:%M:%S", time.localtime(now))
-        for ip, after in current.items():
-            before = self.seen.get(ip)
-            held_for = int(now - self.taken_at.get(ip, now))
-            note = change_note(ip if self.args.full_ip else ip_suffix(ip), before, after, held_for)
-            if note:
+        for name, after in current.items():
+            board = tracked[name].board
+            before = self.seen.get(name)
+            held_for = int(now - self.taken_at.get(name, now))
+            note = change_note(change_label(board, self.args.full_ip), before, after, held_for)
+            if note and (self.args.stm or not board.is_stm):
                 self.changes.append(f"{clock}  {note}")
             if after is None:
-                self.taken_at.pop(ip, None)
+                self.taken_at.pop(name, None)
             elif holder_key(before) != holder_key(after):
-                self.taken_at[ip] = now
+                self.taken_at[name] = now
         self.seen = current
 
     def screen(self, data: list[Row], now: float, color: bool, height: int | None = None) -> list[str]:
         """Header, rows, change log and footer, each after a blank line. Given a height, the frame fits it: the change
-        log is cut first, oldest entry first, then the waiter lines from the last board up, then the rows from the
-        bottom; the header and footer stay."""
-        waiters = sum(len(row.waiters) for row in data) if self.waiting else 0
+        log is cut first, oldest entry first, then the waiter lines from the last board up, the STM rows' waiters last, then
+        the rows from the bottom, the STM rows last; the header and footer stay."""
+        waiters = sum(len(row.waiters) for row in [*data, *stm_rows(data)]) if self.waiting else 0
         body = frame_lines(self.args, data, color, self.where, title=False, waiters=waiters)
         log = [paint(change, DIM, color) for change in self.changes] if self.log else []
         if height is not None:
@@ -901,7 +990,10 @@ class LiveView:
         lines = [live_header(data, now, color), "", *body]
         if log:
             lines += ["", *log]
-        lines += ["", live_footer(self.args.watch, color, self.args.all, self.args.details, self.waiting, self.log)]
+        footer = live_footer(
+            self.args.watch, color, self.args.all, self.args.details, self.waiting, self.log, self.args.stm
+        )
+        lines += ["", footer]
         return lines if height is None else lines[-max(height, 1) :]
 
 
@@ -986,6 +1078,7 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--all", action="store_true", help="show free and missing boards too")
     cli.add_argument("--config-only", action="store_true", help="hide unconfigured lock files")
     cli.add_argument("--details", action="store_true", help="show lock file, PID, command, and age")
+    cli.add_argument("--stm", action="store_true", help="show each frame's STM lock above the boards")
     cli.add_argument("--full-ip", action="store_true", help="show full IPs")
     cli.add_argument("--pid", action="store_true", help="show PIDs in compact output")
     cli.add_argument("--plain", action="store_true", help="print states as words: free, short, medium, long, missing")
@@ -997,7 +1090,10 @@ def parser() -> argparse.ArgumentParser:
         "--watch",
         type=positive_seconds,
         metavar="SECS",
-        help="on a terminal, redraw every SECS seconds; keys a (--all), d (--details), w (waiters), l (log), q (quit)",
+        help=(
+            "on a terminal, redraw every SECS seconds; "
+            "keys a (--all), d (--details), w (waiters), s (--stm), l (log), q (quit)"
+        ),
     )
     cli.add_argument(
         "--color",
