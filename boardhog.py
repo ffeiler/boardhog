@@ -386,12 +386,17 @@ def lock_fds(lock_paths: list[Path]) -> dict[str, list[str]]:
         return found
     for entry in entries:
         try:
-            for fd in (entry / "fd").iterdir():
-                target = os.readlink(fd)
-                if target in found and entry.name not in found[target] and holds_lock(entry / "fdinfo" / fd.name):
-                    found[target].append(entry.name)
+            descriptors = list((entry / "fd").iterdir())
         except OSError:
             continue
+        for fd in descriptors:
+            try:
+                target = os.readlink(fd)
+            except OSError:
+                # A descriptor closed since the listing; the process's other descriptors still count.
+                continue
+            if target in found and entry.name not in found[target] and holds_lock(entry / "fdinfo" / fd.name):
+                found[target].append(entry.name)
     return found
 
 

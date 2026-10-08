@@ -167,6 +167,27 @@ def test_own_open_fd_stands_in_for_an_exited_pid(world):
     assert bh.detailed(row).endswith(", recorded PID=2373047 exited")
 
 
+# Both descriptor orders, so the closed one is listed before the lock's in one of them whatever order /proc lists.
+@pytest.mark.parametrize("closed_first", [False, True])
+def test_a_descriptor_closed_mid_scan_skips_only_itself(world, monkeypatch, closed_first):
+    other = world.root / "other"
+    other.touch()
+    fds = [other, lock_file(world, 21)] if closed_first else [lock_file(world, 21), other]
+    add_process(world, 4321, ["bash"], comm="bash", fds=fds, locked=True)
+    write_locks(world, (21, 2373047, False))
+    real = os.readlink
+
+    def closing(path):
+        target = real(path)
+        if target == str(other.resolve()):
+            raise FileNotFoundError(path)
+        return target
+
+    monkeypatch.setattr(bh.os, "readlink", closing)
+    held = board_rows(world)["192.0.2.21"].holder
+    assert (held.pid, held.source) == ("4321", "fd")
+
+
 def test_a_waiter_with_the_file_open_is_no_holder(world):
     add_process(world, 4321, ["flock", "-w", "900", "9"], comm="flock", fds=[lock_file(world, 21)])
     write_locks(world, (21, 2373047, False), (21, 4321, True))
