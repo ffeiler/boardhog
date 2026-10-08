@@ -112,11 +112,16 @@ class Holder:
     age_seconds: int | None
     script: str | None = None
     alive: bool = True
-    # proc: a PID /proc/locks records; fd: the reader's own process with the lock file open; none: no live holder found.
+    # proc: a PID /proc/locks records; fd: the reader's own process with the lock file open; none: a held lock no recorded PID or readable descriptor accounts for.
     source: str = "proc"
     dead_pid: str | None = None
     # The lock file's mtime, kept for a holder that exited when it is later than host boot.
     opened_at: float | None = None
+
+    @property
+    def hidden(self) -> bool:
+        """The lock is held, yet neither a recorded PID nor a descriptor this reader can read holds it."""
+        return self.source == "none"
 
 
 @dataclass(frozen=True)
@@ -513,7 +518,8 @@ def holder_columns(holder: Holder, show_pid: bool) -> str:
     # Widths fit an age under ten days or "@HH:MM?", 15 characters of the script or kernel comm name and a PID up to
     # pid_max. A longer script name is cut to 15, as the kernel cuts comm.
     pid = f" PID={holder.pid:<7}" if show_pid else ""
-    return f"{holder.user:<12} {age_cell(holder):<10} {display_command(holder)[:15]:<15}{pid}"
+    user = "hidden" if holder.hidden else holder.user
+    return f"{user:<12} {age_cell(holder):<10} {display_command(holder)[:15]:<15}{pid}"
 
 
 def paint(text: str, style: str, color: bool) -> str:
@@ -549,7 +555,7 @@ def compact(row: Row, full_ip: bool, show_pid: bool, plain: bool, mark: str = " 
         return f"{head} {row.board.label}"
     line = f"{head} {holder_columns(row.holder, show_pid)} {paint(f'({row.board.label})', DIM, color)}"
     if not row.holder.alive:
-        line += "  " + paint(f"pid {row.holder.dead_pid} exited", ACCENT, color)
+        line += "  " + paint(f"pid {row.holder.dead_pid} exited, lock held", ACCENT, color)
     if row.waiters:
         line += "  " + paint(f"+{len(row.waiters)} waiting", DIM, color)
     return line
@@ -575,7 +581,7 @@ def group_marks(visible: list[Row], plain: bool, groups: tuple[tuple[str, ...], 
         # Every member present and adjacent, so the bracket never spans a row outside the group.
         if len(indices) != len(group) or indices != list(range(indices[0], indices[0] + len(group))):
             continue
-        # Compare PIDs only: a holder whose process has gone reads as user "unknown" and still counts.
+        # Compare PIDs only: a holder whose process has gone reads as user "hidden" and still counts.
         pids = {visible[index].holder.pid if visible[index].holder else None for index in indices}
         if len(pids) != 1 or None in pids:
             continue
@@ -643,7 +649,8 @@ def detailed(row: Row) -> str:
     else:
         clock = opened_clock(held)
         opened = "open time unknown" if clock is None else f"lock file opened {clock}"
-        line = f"{prefix} locked, holder PID={held.dead_pid} exited, {opened}"
+        held_by = "lock held by no fd this reader can read"
+        line = f"{prefix} locked, holder PID={held.dead_pid} exited, {held_by}, {opened}"
     for waiter in row.waiters:
         line += (
             f"\n    waiting: {waiter.user} (PID={waiter.pid}, CMD={display_command(waiter)})"
@@ -671,6 +678,7 @@ def holder_json(holder: Holder | None) -> dict[str, object] | None:
         "alive": holder.alive,
         "source": holder.source,
         "dead_pid": holder.dead_pid,
+        "hidden": holder.hidden,
     }
 
 
@@ -795,7 +803,9 @@ def change_note(label: str, before: Holder | None, after: Holder | None, held_fo
     """One change-log entry for a board between two refreshes, or None when its holder did not change."""
     if holder_key(before) == holder_key(after):
         if before is not None and after is not None and before.alive and not after.alive:
-            return f"{label} holder pid {after.dead_pid} exited ({before.user} {display_command(before)})"
+            # A recorded PID that exited, or the reader's own process whose descriptor no longer holds the lock.
+            gone = "exited" if before.source == "proc" else "let go"
+            return f"{label} holder pid {before.pid} {gone}, lock held ({before.user} {display_command(before)})"
         return None
     if after is None:
         return f"{label} freed ({who_holds(before)}, held {duration(held_for)})"
@@ -804,11 +814,11 @@ def change_note(label: str, before: Holder | None, after: Holder | None, held_fo
         return f"{label} {who_holds(before)} -> {who_holds(after)} (held {duration(held_for)})"
     if after.alive:
         return f"{label} taken by {after.user} {display_command(after)}"
-    return f"{label} taken, holder pid {after.dead_pid} exited"
+    return f"{label} taken, holder pid {after.dead_pid} exited, lock held"
 
 
 def who_holds(held: Holder) -> str:
-    return f"{held.user} {display_command(held)}" if held.alive else f"pid {held.dead_pid}"
+    return f"{held.user} {display_command(held)}" if held.alive else f"hidden pid {held.dead_pid}"
 
 
 class LiveView:

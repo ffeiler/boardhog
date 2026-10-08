@@ -139,10 +139,10 @@ def test_an_exited_holder_shows_its_open_time(world):
     assert row.state == "short"
     line = bh.compact(row, full_ip=False, show_pid=False, plain=True)
     clock = time.strftime("%H:%M", time.localtime(opened))
-    assert f" @{clock}? " in line
-    assert bh.detailed(row).endswith(f"exited, lock file opened {clock}")
+    assert f" hidden{' ' * 7}@{clock}? " in line
+    assert bh.detailed(row).endswith(f"exited, lock held by no fd this reader can read, lock file opened {clock}")
     assert line.split()[1] == "short"
-    assert line.endswith("(frame_1[0])  pid 777 exited")
+    assert line.endswith("(frame_1[0])  pid 777 exited, lock held")
 
 
 def test_an_exited_holder_never_reads_long_for_an_unknown_age(world):
@@ -153,7 +153,7 @@ def test_an_exited_holder_never_reads_long_for_an_unknown_age(world):
     row = board_rows(world)["192.0.2.21"]
     assert row.holder == _dead(opened_at=None)
     assert row.state == bh.DEAD_UNKNOWN_STATE != "long"
-    assert bh.compact(row, full_ip=False, show_pid=False, plain=True).split()[2:5] == ["?", "-", "-"]
+    assert bh.compact(row, full_ip=False, show_pid=False, plain=True).split()[2:5] == ["hidden", "-", "-"]
     assert "open time unknown" in bh.detailed(row)
 
 
@@ -173,7 +173,9 @@ def test_a_waiter_with_the_file_open_is_no_holder(world):
     row = board_rows(world)["192.0.2.21"]
     assert (row.holder.alive, row.holder.source, row.holder.dead_pid) == (False, "none", "2373047")
     assert [waiter.pid for waiter in row.waiters] == ["4321"]
-    assert bh.compact(row, full_ip=False, show_pid=False, plain=True).endswith("pid 2373047 exited  +1 waiting")
+    assert bh.compact(row, full_ip=False, show_pid=False, plain=True).endswith(
+        "pid 2373047 exited, lock held  +1 waiting"
+    )
     assert bh.detailed(row).splitlines()[1] == f"    waiting: {ME} (PID=4321, CMD=flock) for unknown"
 
 
@@ -224,17 +226,24 @@ def test_json_adds_holder_waiter_and_mtime_fields(world):
     write_locks(world, (21, 500, False), (21, 501, True))
     data = board_rows(world)
     blob = bh.as_json(data["192.0.2.21"])
-    assert {key: blob["holder"][key] for key in ("script", "alive", "source", "dead_pid")} == {
+    assert {key: blob["holder"][key] for key in ("script", "alive", "source", "dead_pid", "hidden")} == {
         "script": "run.py",
         "alive": True,
         "source": "proc",
         "dead_pid": None,
+        "hidden": False,
     }
-    assert [waiter["pid"] for waiter in blob["waiters"]] == ["501"]
+    assert [(waiter["pid"], waiter["hidden"]) for waiter in blob["waiters"]] == [("501", False)]
     mtime = lock_file(world, 21).stat().st_mtime
     assert datetime.fromisoformat(blob["lock_mtime"]).timestamp() == int(mtime)
     free = bh.as_json(data["192.0.2.22"])
     assert (free["holder"], free["waiters"], free["state"]) == (None, [], "free")
+
+
+def test_json_marks_a_hidden_holder_and_keeps_its_user(world):
+    write_locks(world, (21, 777, False))
+    held = bh.as_json(board_rows(world)["192.0.2.21"])["holder"]
+    assert (held["user"], held["hidden"], held["source"], held["dead_pid"]) == ("?", True, "none", "777")
 
 
 def test_free_summary_joins_consecutive_boards():
@@ -287,6 +296,6 @@ def test_accent_marks_dead_and_long_holds_only():
     short = bh.compact(short_row, False, False, False, color=True)
     assert bh.ACCENT not in short and bh.DIM + "(frame_1[0])" + bh.RESET in short
     dead = bh.compact(dead_row, False, False, False, color=True)
-    assert dead.count(bh.ACCENT) == 2 and dead.endswith(bh.ACCENT + "pid 777 exited" + bh.RESET)
+    assert dead.count(bh.ACCENT) == 2 and dead.endswith(bh.ACCENT + "pid 777 exited, lock held" + bh.RESET)
     for row in (long_row, short_row, dead_row):
         assert "\x1b" not in bh.compact(row, False, False, False)

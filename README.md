@@ -16,10 +16,10 @@ The command column names the script from the process's command line: the first a
 
 ## Holders that exited
 
-`/proc/locks` records the PID that took a lock. When that process has exited and a child or a shell still holds the descriptor, as `exec 9>FILE; flock 9` leaves it, `boardhog` tries every PID the lock records, then the reader's own processes whose descriptor on the lock file holds the lock (`lock:` in `/proc/<pid>/fdinfo`), so a shell waiting for the lock never counts. Another user's descriptors are unreadable, so their row reads:
+`/proc/locks` records the PID that took a lock. When that process has exited and a child or a shell still holds the descriptor, as `exec 9>FILE; flock 9` leaves it, `boardhog` tries every PID the lock records, then the reader's own processes whose descriptor on the lock file holds the lock (`lock:` in `/proc/<pid>/fdinfo`), so a shell waiting for the lock never counts. The kernel drops a `flock` only when the last descriptor on its open file closes, so a lock that `/proc/locks` still lists is held even after its recorded PID has exited. Another user's descriptors are unreadable, so when no descriptor the reader can read holds the lock, the row reads `hidden` in the user column and names the recorded PID and that the lock is held:
 
 ```text
-2.5   ● ?            @12:59?    -               (frame_2)  pid 2373047 exited
+2.5   ● hidden       @12:59?    -               (frame_2)  pid 2373047 exited, lock held
 ```
 
 `@HH:MM?` is the lock file's mtime, shown only when it is later than host boot. Only a truncating open such as `exec 9>FILE` moves it, and a shell that waits for the lock moves it too, so it is a hint; otherwise the cell reads `-`. Such a row takes its state from that open time, or `medium` when there is none, never `long` for an unknown age.
@@ -63,7 +63,7 @@ With `w` on, each waiter gets a dim line under its holder's row, `↳` in the do
 
 The `+N waiting` note stays on the row. `w` belongs to the live view alone, since `--details` lists waiters too, and in the details view it changes nothing. Waiters are listed as `/proc/locks` lists them, which implies no order.
 
-The header names the time of the last redraw and counts free boards out of all boards per network-config `type` (`248` reads `spinn48`, `201` reads `spinn1`); a board whose holder exited counts as taken, one without a lock file as not free. Under the rows, dim, are the last two changes the view saw: a board taken, freed (with how long it was held), handed over between two refreshes (one line, `2.21 alice pytest -> bob run_tier.sh (held 42m 10s)`), or its holder exited. A hold already running when the view starts dates from its process's start, as the age column does. The log lives only while the view runs and continues recording while hidden. The footer names the refresh interval and the keys. When the terminal is too short, the change log is cut first, then the waiter lines from the last board up, then the rows from the bottom, and the header and footer stay; long lines are clipped at its width.
+The header names the time of the last redraw and counts free boards out of all boards per network-config `type` (`248` reads `spinn48`, `201` reads `spinn1`); a board whose holder exited counts as taken, one without a lock file as not free. Under the rows, dim, are the last two changes the view saw: a board taken, freed (with how long it was held), handed over between two refreshes (one line, `2.21 alice pytest -> bob run_tier.sh (held 42m 10s)`), or its holder exited while the lock stays held (`2.24 holder pid 2373047 exited, lock held (alice pytest)`; a holder found by its descriptor reads `let go` instead of `exited`). A hidden holder reads `hidden pid 2373047` in freed and handover lines. A hold already running when the view starts dates from its process's start, as the age column does. The log lives only while the view runs and continues recording while hidden. The footer names the refresh interval and the keys. When the terminal is too short, the change log is cut first, then the waiter lines from the last board up, then the rows from the bottom, and the header and footer stay; long lines are clipped at its width.
 
 ## Install
 
@@ -100,7 +100,7 @@ Run `boardhog --help` for all flags.
 Unavailable Boards
 
 2.21  ● alice        12m 04s    run_tier.sh     (frame_1[0])  +1 waiting
-2.24  ● ?            @12:59?    -               (frame_1[3])  pid 2373047 exited
+2.24  ● hidden       @12:59?    -               (frame_1[3])  pid 2373047 exited, lock held
 ```
 
 `--all`:
@@ -137,12 +137,12 @@ Boards cabled into one machine (`CABLED_GROUPS` in `boardhog.py`) get a bracket 
 ```text
 192.0.2.21      (BOARD_192_0_2_21.lock): locked by alice (PID=1234, CMD=run_tier.sh) for 12m 04s
     waiting: bob (PID=1301, CMD=flock) for 2m 36s
-192.0.2.24      (BOARD_192_0_2_24.lock): locked, holder PID=2373047 exited, lock file opened 12:59
+192.0.2.24      (BOARD_192_0_2_24.lock): locked, holder PID=2373047 exited, lock held by no fd this reader can read, lock file opened 12:59
 ```
 
-`--json`, one object per board (abridged here). `lock_mtime` is ISO time with the local offset. A holder carries `script`, `alive`, `source` (`proc` a PID `/proc/locks` records, `fd` the reader's own process with the file open, `none` no live holder found) and `dead_pid` (the recorded PID that exited, else `null`); `waiters` lists blocked processes in the holder's shape:
+`--json`, one object per board (abridged here). `lock_mtime` is ISO time with the local offset. A holder carries `script`, `alive`, `source` (`proc` a PID `/proc/locks` records, `fd` the reader's own process with the file open, `none` a held lock whose recorded PIDs exited and that no descriptor the reader can read holds), `dead_pid` (the recorded PID that exited, else `null`) and `hidden` (`true` for source `none`, whose `user` stays `?`, else `false`); `waiters` lists blocked processes in the holder's shape:
 
 ```json
-[{"ip":"192.0.2.21","lock_mtime":"2026-10-06T12:59:54+02:00","state":"long","holder":{"pid":"1234","user":"alice","command":"bash","script":"run_tier.sh","age_seconds":724,"age":"12m 04s","alive":true,"source":"proc","dead_pid":null},"waiters":[{"pid":"1301","user":"bob","command":"flock","script":"flock","age_seconds":156,"age":"2m 36s","alive":true,"source":"proc","dead_pid":null}]}]
+[{"ip":"192.0.2.21","lock_mtime":"2026-10-06T12:59:54+02:00","state":"long","holder":{"pid":"1234","user":"alice","command":"bash","script":"run_tier.sh","age_seconds":724,"age":"12m 04s","alive":true,"source":"proc","dead_pid":null,"hidden":false},"waiters":[{"pid":"1301","user":"bob","command":"flock","script":"flock","age_seconds":156,"age":"2m 36s","alive":true,"source":"proc","dead_pid":null,"hidden":false}]}]
 ```
 

@@ -323,7 +323,7 @@ def test_change_log_notes_taken_freed_and_exited():
     view.update(snapshot(b22=holder("700", user="carol"), b23=holder("600", alive=False)), later)
     assert list(view.changes) == [
         f"{clock(later)}  2.22 taken by carol run.py",
-        f"{clock(later)}  2.23 holder pid 600 exited (bob x.py)",
+        f"{clock(later)}  2.23 holder pid 600 exited, lock held (bob x.py)",
     ]
     view = bh.LiveView(bh.parser().parse_args(["-n", "1"]), "nowhere")
     view.update(snapshot(b21=holder("500", age=60)), start)
@@ -341,7 +341,28 @@ def test_change_log_ignores_finding_the_shell_behind_an_exited_pid():
     view.update(snapshot(b21=holder("777", alive=False)), time.time())
     view.update(snapshot(b21=found), time.time())
     view.update(snapshot(b22=holder("800", alive=False), b21=found), time.time())
-    assert [change.split("  ", 1)[1] for change in view.changes] == ["2.22 taken, holder pid 800 exited"]
+    assert [change.split("  ", 1)[1] for change in view.changes] == ["2.22 taken, holder pid 800 exited, lock held"]
+
+
+def test_change_log_names_the_own_process_that_let_go():
+    view = bh.LiveView(bh.parser().parse_args(["-n", "1"]), "nowhere")
+    found = bh.Holder(pid="4321", user=ME, command="bash", age_seconds=5, source="fd", dead_pid="777")
+    view.update(snapshot(b21=found), time.time())
+    view.update(snapshot(b21=holder("777", alive=False)), time.time())
+    assert [change.split("  ", 1)[1] for change in view.changes] == [
+        f"2.21 holder pid 4321 let go, lock held ({ME} bash)"
+    ]
+
+
+def test_change_log_names_a_hidden_holder():
+    view = bh.LiveView(bh.parser().parse_args(["-n", "1"]), "nowhere")
+    start = time.time()
+    view.update(snapshot(b21=holder("777", alive=False), b22=holder("800", alive=False)), start)
+    view.update(snapshot(b21=holder("500")), start + 10)
+    assert [change.split("  ", 1)[1] for change in view.changes] == [
+        "2.21 hidden pid 777 -> alice run.py (held 10s)",
+        "2.22 freed (hidden pid 800, held 10s)",
+    ]
 
 
 def test_a_handover_is_one_line_naming_both_holders():
@@ -352,7 +373,7 @@ def test_a_handover_is_one_line_naming_both_holders():
     view.update(snapshot(b21=holder("700", alive=False)), start + 15)
     assert list(view.changes) == [
         f"{clock(start + 10)}  2.21 ekagupta ring_chip_mc -> carol pytest (held 42m 10s)",
-        f"{clock(start + 15)}  2.21 carol pytest -> pid 700 (held 5s)",
+        f"{clock(start + 15)}  2.21 carol pytest -> hidden pid 700 (held 5s)",
     ]
 
 
