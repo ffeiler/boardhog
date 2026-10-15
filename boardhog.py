@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import glob
 import ipaddress
 import json
@@ -13,13 +14,17 @@ import pwd
 import re
 import select
 import signal
+import socket
+import struct
+import subprocess
 import sys
 import termios
+import threading
 import time
 import tty
 from collections import deque
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -74,6 +79,25 @@ CABLED_GROUPS = (("192.168.1.21", "192.168.1.22", "192.168.1.23"),)
 BRACKETS = {False: ("┌", "├", "└"), True: ("/", "|", "\\")}
 # The bracket on a waiter line between a group's top and bottom rows, indexed by plain.
 BRACKET_LINE = {False: "│", True: "|"}
+
+# The one STM controller request boardhog sends: firmware status (0x64) to board_dest 0, the frame's own controller.
+# Each request overwrites the controller's single reply address, so it goes out only under the frame's STM lock.
+# Never send 0x62, 0x22, 0x41 or 0x43, and never SNMP.
+STM_PORT = 8
+STM_MAGIC = 0x722ACCE7
+STM_STATUS = 0x64
+STM_STATUS_REQUEST = struct.pack("<BBBBIII", 0, STM_STATUS, 0, 0, 0, 0, STM_MAGIC)
+STM_REPLY_SECONDS = 0.25
+# The live view checks the controllers this often while `s` is on, and redraws this soon after a check lands.
+STM_PROBE_INTERVAL = 60
+# Turning `s` back on checks again, but never sooner than this after the last round began.
+STM_PROBE_MIN_GAP = 5
+PROBE_REDRAW = 0.2
+# Check results the stm line names, in the accent.
+PROBE_FAULTS = ("unreachable", "no reply")
+# Held by a check from taking a frame's STM lock to letting it go, and by the live view's lock scan, so the view never
+# lists its own check as the lock's holder.
+PROBE_GATE = threading.Lock()
 
 DEV_INODE_RE = re.compile(r"^([0-9a-fA-F]+:[0-9a-fA-F]+):(\d+)$")
 PID_RE = re.compile(r"^-?\d+$")
@@ -137,6 +161,18 @@ class LockPids:
 
 
 @dataclass(frozen=True)
+class StmProbe:
+    """One check of a frame's STM controller."""
+
+    # ok, lock held (the read skipped), unreachable (no ICMP reply) or no reply (ICMP answered, the read did not).
+    state: str
+    icmp: bool
+    udp_ms: float | None
+    # time.time() once the echo answered or timed out.
+    checked_at: float
+
+
+@dataclass(frozen=True)
 class Row:
     board: Board
     lock_path: Path
@@ -148,6 +184,8 @@ class Row:
     frame_stm: Row | None = None
     # A PID that holds this board's lock is blocked on its frame's STM lock.
     waiting_on_stm: bool = False
+    # On a frame's STM row, the last check of its controller; None when none ran.
+    probe: StmProbe | None = None
 
     @property
     def state(self) -> str:
@@ -370,6 +408,75 @@ def stm_rows(data: list[Row]) -> list[Row]:
     """Each frame's STM row once, in address order."""
     found = {row.frame_stm.board.ip: row.frame_stm for row in data if row.frame_stm is not None}
     return sorted(found.values(), key=lambda row: ip_key(row.board.ip))
+
+
+def ping(ip: str) -> bool:
+    """One ICMP echo through the system ping, which needs no raw socket or root of its own."""
+    try:
+        return subprocess.run(["ping", "-n", "-c", "1", "-W", "1", ip], capture_output=True, timeout=5).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def stm_status_ms(ip: str) -> float | None:
+    """Milliseconds to a valid firmware-status reply from the controller at `ip`, or None on a timeout or any other
+    reply: one request on a new socket, no retry."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(STM_REPLY_SECONDS)
+            start = time.monotonic()
+            sock.sendto(STM_STATUS_REQUEST, (ip, STM_PORT))
+            reply, source = sock.recvfrom(256)
+            elapsed = round((time.monotonic() - start) * 1000, 3)
+    except OSError:
+        return None
+    if len(reply) != 16 or source != (ip, STM_PORT):
+        return None
+    dest, opcode, _, _, _, _, magic = struct.unpack("<BBBBIII", reply)
+    return elapsed if (dest, opcode, magic) == (0, STM_STATUS, STM_MAGIC) else None
+
+
+def probe_stm(ip: str, lock_path: Path) -> StmProbe:
+    """One check of a frame's STM controller: an ICMP echo, then, only while the frame's STM lock is free, one
+    firmware-status read with that lock taken for the one exchange."""
+    icmp = ping(ip)
+    checked_at = time.time()
+    if not icmp:
+        return StmProbe("unreachable", False, None, checked_at)
+    with PROBE_GATE:
+        try:
+            # Read-only and without O_CREAT, so the lock file's mtime, the hint at its last truncating open, stays put.
+            fd = os.open(lock_path, os.O_RDONLY)
+        except OSError:
+            # A lock file removed since the scan grants no lock either.
+            return StmProbe("lock held", True, None, checked_at)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            udp_ms = stm_status_ms(ip)
+        except OSError:
+            return StmProbe("lock held", True, None, checked_at)
+        finally:
+            os.close(fd)
+    return StmProbe("no reply" if udp_ms is None else "ok", True, udp_ms, checked_at)
+
+
+def probe_all(controllers: list[Board], locks_dir: Path) -> dict[str, StmProbe]:
+    """One check of each frame's STM controller in turn, keyed by its address."""
+    return {board.ip: probe_stm(board.ip, locks_dir / board.lock_name) for board in controllers}
+
+
+def probe_targets(data: list[Row]) -> list[Board]:
+    """The STM controllers to check: each frame's, unless its STM lock file is missing, since no lock could gate the
+    read."""
+    return [row.board for row in stm_rows(data) if row.lock_file_exists]
+
+
+def with_probes(data: list[Row], probes: dict[str, StmProbe]) -> list[Row]:
+    """The rows with each frame's STM row carrying its controller's last check from `probes`, keyed by address."""
+    if not probes:
+        return data
+    stms = {row.board.ip: replace(row, probe=probes.get(row.board.ip)) for row in stm_rows(data)}
+    return [replace(row, frame_stm=stms[row.frame_stm.board.ip]) if row.frame_stm else row for row in data]
 
 
 def resolve_holder(
@@ -685,9 +792,9 @@ def detailed(row: Row) -> str:
     label = f"STM {row.board.ip}" if row.board.is_stm else row.board.ip
     prefix = f"{label:<15} ({row.board.lock_name}):"
     if row.state == "missing":
-        return f"{prefix} missing lock file"
+        return f"{prefix} missing lock file{probe_note(row.probe)}"
     if row.holder is None:
-        return f"{prefix} free (no lock held)"
+        return f"{prefix} free (no lock held){probe_note(row.probe)}"
     held = row.holder
     if held.alive:
         line = f"{prefix} locked by {held.user} (PID={held.pid}, CMD={display_command(held)}) for {duration(held.age_seconds)}"
@@ -700,12 +807,21 @@ def detailed(row: Row) -> str:
         line = f"{prefix} locked, holder PID={held.dead_pid} exited, {held_by}, {opened}"
     if row.waiting_on_stm:
         line += ", waiting on stm"
+    line += probe_note(row.probe)
     for waiter in row.waiters:
         line += (
             f"\n    waiting: {waiter.user} (PID={waiter.pid}, CMD={display_command(waiter)})"
             f" for {duration(waiter.age_seconds)}"
         )
     return line
+
+
+def probe_note(probe: StmProbe | None) -> str:
+    """The line under a frame's STM entry under --details with its controller's last check, or nothing."""
+    if probe is None:
+        return ""
+    timing = "" if probe.udp_ms is None else f" in {probe.udp_ms:.2f} ms"
+    return f"\n    probe: {probe.state}{timing}, {duration(max(int(time.time() - probe.checked_at), 0))} ago"
 
 
 def iso(timestamp: float | None) -> str | None:
@@ -748,6 +864,7 @@ def as_json(row: Row) -> dict[str, object]:
         "waiters": [holder_json(waiter) for waiter in row.waiters],
         "stm": stm_json(row.frame_stm),
         "waiting_on_stm": row.waiting_on_stm,
+        "stm_probe": probe_json(row.frame_stm.probe if row.frame_stm else None),
     }
 
 
@@ -761,6 +878,17 @@ def stm_json(row: Row | None) -> dict[str, object] | None:
         "state": row.state,
         "holder": holder_json(row.holder),
         "waiters": [holder_json(waiter) for waiter in row.waiters],
+    }
+
+
+def probe_json(probe: StmProbe | None) -> dict[str, object] | None:
+    if probe is None:
+        return None
+    return {
+        "state": probe.state,
+        "icmp": probe.icmp,
+        "udp_ms": probe.udp_ms,
+        "checked_at": datetime.fromtimestamp(probe.checked_at, timezone.utc).isoformat(timespec="seconds"),
     }
 
 
@@ -782,18 +910,21 @@ def sources(args: argparse.Namespace) -> tuple[Path, Path]:
 
 def stm_line(args: argparse.Namespace, data: list[Row], color: bool) -> str | None:
     """Under --stm, one dim line naming who holds each frame's STM lock, in address order: `stm`, then each holder and
-    its frame, and under --all a free or missing one by its state. None under --details, which lists the STM locks in
-    full, and when none is left to show."""
+    its frame, and under --all a free or missing one by its state; then, in the accent, each frame whose controller
+    failed its last check. None under --details, which lists the STM locks in full, and when none is left to show."""
     if not args.stm or args.details:
         return None
-    shown = [row for row in stm_rows(data) if is_visible(row, args.all)]
-    if not shown:
+    frames = stm_rows(data)
+    shown = [row for row in frames if is_visible(row, args.all)]
+    faults = [row for row in frames if row.probe is not None and row.probe.state in PROBE_FAULTS]
+    if not shown and not faults:
         return None
     cells = ["stm"]
     for row in shown:
         who = row.state if row.holder is None else ("hidden" if row.holder.hidden else row.holder.user)
         cells.append(f"{who} ({row.board.label})")
-    return paint("  ".join(cells), DIM, color)
+    line = paint("  ".join(cells), DIM, color)
+    return line + "".join("  " + paint(f"{row.board.label} STM {row.probe.state}", ACCENT, color) for row in faults)
 
 
 def frame_lines(
@@ -811,7 +942,12 @@ def frame_lines(
     if lines:
         lines.append("")
 
-    stms = [row for row in stm_rows(data) if is_visible(row, args.all)] if args.stm and args.details else []
+    # A checked frame's STM lock shows even when free, so --details names every frame's last check.
+    stms = (
+        [row for row in stm_rows(data) if is_visible(row, args.all) or row.probe is not None]
+        if args.stm and args.details
+        else []
+    )
     if stms:
         lines += [line for row in stms for line in detailed(row).split("\n")]
         lines.append("")
@@ -840,6 +976,8 @@ def frame_lines(
 def print_rows(args: argparse.Namespace) -> None:
     config_root, locks_dir = sources(args)
     data = rows(config_root, locks_dir, include_unconfigured=not args.config_only)
+    if args.stm:
+        data = with_probes(data, probe_all(probe_targets(data), locks_dir))
 
     if args.json:
         visible = [row for row in data if is_visible(row, args.all)]
@@ -922,6 +1060,39 @@ def change_label(board: Board, full_ip: bool) -> str:
     if board.is_stm:
         return f"stm {board.label}"
     return board.ip if full_ip else ip_suffix(board.ip)
+
+
+class StmProber:
+    """The live view's checks of the frames' STM controllers: one round at a time in a background thread, at most every
+    STM_PROBE_INTERVAL seconds, so a slow ping never stalls the redraw. A finished round replaces `results` whole."""
+
+    def __init__(self, locks_dir: Path) -> None:
+        self.locks_dir = locks_dir
+        self.results: dict[str, StmProbe] = {}
+        self.thread: threading.Thread | None = None
+        self.due = 0.0
+        self.started = -math.inf
+
+    def reset(self) -> None:
+        """Forget the last results and check at the next poll, as when `s` turns on, though not within
+        STM_PROBE_MIN_GAP of the last round's start."""
+        self.results = {}
+        self.due = self.started + STM_PROBE_MIN_GAP
+
+    def busy(self) -> bool:
+        return self.thread is not None and self.thread.is_alive()
+
+    def poll(self, controllers: list[Board], now: float) -> None:
+        """Start a round over `controllers` when one is due and none is running; `now` is time.monotonic()."""
+        if not controllers or self.busy() or now < self.due:
+            return
+        self.started = now
+        self.due = now + STM_PROBE_INTERVAL
+        self.thread = threading.Thread(target=self.round, args=(controllers,), daemon=True)
+        self.thread.start()
+
+    def round(self, controllers: list[Board]) -> None:
+        self.results = probe_all(controllers, self.locks_dir)
 
 
 class LiveView:
@@ -1042,6 +1213,8 @@ def run_live(args: argparse.Namespace, stdin=None, stdout=None) -> int:
     stdout = stdout or sys.stdout
     config_root, locks_dir = sources(args)
     view = LiveView(args, f"{config_root / NETWORK_CONFIG} or {locks_dir}")
+    prober = StmProber(locks_dir)
+    probing = False
     color = use_color(args.plain, stdout, args.color)
     fd = stdin.fileno() if stdin.isatty() else None
     saved = termios.tcgetattr(fd) if fd is not None else None
@@ -1054,12 +1227,25 @@ def run_live(args: argparse.Namespace, stdin=None, stdout=None) -> int:
         stdout.write(ENTER_SCREEN)
         while True:
             if data is None or time.monotonic() >= due:
-                data = rows(config_root, locks_dir, include_unconfigured=not args.config_only)
+                with PROBE_GATE:
+                    data = rows(config_root, locks_dir, include_unconfigured=not args.config_only)
                 view.update(data, time.time())
                 due = time.monotonic() + args.watch
+            # The controllers are checked when `s` turns on, or at the start under --stm, then every STM_PROBE_INTERVAL.
+            if view.args.stm and not probing:
+                prober.reset()
+            probing = view.args.stm
+            if probing:
+                prober.poll(probe_targets(data), time.monotonic())
+            probes = prober.results
             height = terminal_lines(stdout)
-            draw(stdout, view.screen(data, time.time(), color, height), height)
+            draw(stdout, view.screen(with_probes(data, probes), time.time(), color, height), height)
             wait = max(due - time.monotonic(), 0.0)
+            if probing and prober.due > time.monotonic():
+                wait = min(wait, prober.due - time.monotonic())
+            if prober.busy() or prober.results is not probes:
+                # A round in flight shows soon after it ends, not at the next refresh.
+                wait = min(wait, PROBE_REDRAW)
             if fd is None:
                 time.sleep(wait)
                 continue
@@ -1095,7 +1281,7 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--all", action="store_true", help="show free and missing boards too")
     cli.add_argument("--config-only", action="store_true", help="hide unconfigured lock files")
     cli.add_argument("--details", action="store_true", help="show lock file, PID, command, and age")
-    cli.add_argument("--stm", action="store_true", help="name each frame's STM lock holder under the title")
+    cli.add_argument("--stm", action="store_true", help="name each frame's STM lock holder and check its controller")
     cli.add_argument("--full-ip", action="store_true", help="show full IPs")
     cli.add_argument("--pid", action="store_true", help="show PIDs in compact output")
     cli.add_argument("--plain", action="store_true", help="print states as words: free, short, medium, long, missing")

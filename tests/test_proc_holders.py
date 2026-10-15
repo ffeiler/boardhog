@@ -403,12 +403,11 @@ def test_stm_rows_come_first_under_stm_and_the_note_stays_without(world, capsys)
 
     bh.print_rows(bh.parser().parse_args(["--stm", "--details", *where]))
     lines = capsys.readouterr().out.splitlines()
-    assert lines[2:5] == [
-        f"STM 192.0.2.2   (STM_192_0_2_2.lock): locked by {ME} (PID=500, CMD=probe.py) for unknown",
-        f"    waiting: {ME} (PID=600, CMD=run.py) for unknown",
-        "",
-    ]
-    assert lines[6].endswith(", waiting on stm")
+    assert lines[2] == f"STM 192.0.2.2   (STM_192_0_2_2.lock): locked by {ME} (PID=500, CMD=probe.py) for unknown"
+    # /proc/locks is fake, so the real STM lock is free and the fake network in conftest.py answers the check.
+    assert lines[3].startswith("    probe: ok in ") and lines[3].endswith(" ms, 0s ago")
+    assert lines[4:6] == [f"    waiting: {ME} (PID=600, CMD=run.py) for unknown", ""]
+    assert lines[7].endswith(", waiting on stm")
 
     bh.print_rows(bh.parser().parse_args(["--plain", *where]))
     lines = capsys.readouterr().out.splitlines()

@@ -87,7 +87,17 @@ STM 192.0.2.2   (STM_192_0_2_2.lock): locked by alice (PID=1234, CMD=stm_boot_pr
     waiting: bob (PID=1301, CMD=run_pytest_script.py) for 1h 24m
 ```
 
-The STM lock is local to this host. A server that loads through the same STM controller takes the lock on its own disk, so its holds and waits never show here.
+Under `--stm` boardhog also checks each frame's STM controller: one ICMP echo through the system `ping`, then, only while the frame's STM lock is free, one firmware-status read (`0x64`) over UDP with that lock taken for the one exchange, a quarter second at most. A frame whose STM lock is held skips the read (`lock held`), and a frame without an STM lock file is not checked. A static run checks once; the live view checks when `s` turns on, or at its start under `--stm`, then every 60 s while `s` stays on, in the background so a slow ping never holds up a redraw. Only a fault shows, in the accent at the end of the `stm` line, which then appears even with no STM lock held:
+
+```text
+stm  carol (frame_2)  frame_1 STM unreachable
+```
+
+`unreachable` is a controller that misses the echo, `no reply` one that answers the echo but not the read within 0.25 s, as hung firmware does. `--details --stm` lists every checked frame and gives its STM entry a line with the last result and its age: `probe: ok in 0.14 ms, 12s ago`, or `lock held`, `unreachable` or `no reply`.
+
+Each read overwrites the controller's single reply address, so it waits for the STM lock; boardhog sends no other request and no SNMP. Another boardhog can catch the check holding the STM lock.
+
+The STM lock is local to this host. A server that loads through the same STM controller takes the lock on its own disk, so its holds and waits never show here, and the check cannot wait for its loads.
 
 ## Install
 
@@ -105,7 +115,7 @@ Common checks:
 boardhog                         # locked boards only
 boardhog --all                   # include free and missing boards
 boardhog --details               # lock file, PID, command, age
-boardhog --stm                   # frame STM lock holders under the title
+boardhog --stm                   # frame STM lock holders, controller faults
 boardhog -n 1                    # live view, redrawn every second
 ```
 
@@ -165,7 +175,7 @@ Boards cabled into one machine (`CABLED_GROUPS` in `boardhog.py`) get a bracket 
 192.0.2.24      (BOARD_192_0_2_24.lock): locked, holder PID=2373047 exited, lock held by no fd this reader can read, lock file opened 12:59
 ```
 
-`--json`, one object per board (abridged here). `lock_mtime` is ISO time with the local offset. A holder carries `script`, `alive`, `source` (`proc` a PID `/proc/locks` records, `fd` the reader's own process with the file open, `none` a held lock whose recorded PIDs exited and that no descriptor the reader can read holds), `dead_pid` (the recorded PID that exited, else `null`) and `hidden` (`true` for source `none`, whose `user` stays `?`, else `false`); `waiters` lists blocked processes in the holder's shape. `stm` is the frame's STM lock (`lock_name`, `lock_path`, `lock_file_exists`, `state`, `holder`, `waiters`, shaped as the board's own), `null` for a machine without an IPv4 `STM_IP`, and `waiting_on_stm` is `true` when the board's holder is blocked on it. Both are present with or without `--stm`, and the output stays a list of boards:
+`--json`, one object per board (abridged here). `lock_mtime` is ISO time with the local offset. A holder carries `script`, `alive`, `source` (`proc` a PID `/proc/locks` records, `fd` the reader's own process with the file open, `none` a held lock whose recorded PIDs exited and that no descriptor the reader can read holds), `dead_pid` (the recorded PID that exited, else `null`) and `hidden` (`true` for source `none`, whose `user` stays `?`, else `false`); `waiters` lists blocked processes in the holder's shape. `stm` is the frame's STM lock (`lock_name`, `lock_path`, `lock_file_exists`, `state`, `holder`, `waiters`, shaped as the board's own), `null` for a machine without an IPv4 `STM_IP`, and `waiting_on_stm` is `true` when the board's holder is blocked on it. Both are present with or without `--stm`. `stm_probe` is the frame's last controller check under `--stm` (`state`, `icmp`, `udp_ms` or `null`, `checked_at` in UTC), else `null`. The output stays a list of boards:
 
 ```json
 [{"ip":"192.0.2.21","lock_mtime":"2026-10-06T12:59:54+02:00","state":"long","holder":{"pid":"1234","user":"alice","command":"bash","script":"run_tier.sh","age_seconds":724,"age":"12m 04s","alive":true,"source":"proc","dead_pid":null,"hidden":false},"waiters":[{"pid":"1301","user":"bob","command":"flock","script":"flock","age_seconds":156,"age":"2m 36s","alive":true,"source":"proc","dead_pid":null,"hidden":false}]}]
