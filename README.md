@@ -6,7 +6,7 @@ Board inventory comes from the SpiNNaker2 network config, whose `ETH_IP_START` m
 
 ## Status Indicators
 
-`●` held • `○` free • `?` missing lock file. `--plain` prints the state as a word padded to one width, splitting held by age into `short` (<1 min), `medium` (1-5 min) and `long` (>5 min or unknown).
+`●` held • `○` free • `?` missing lock file. `--plain` prints the state as a word padded to one width, splitting held by age into `short` (<1 min), `medium` (1-15 min) and `long` (>15 min or unknown). `--long-after MINUTES` moves the start of `long`, where the dot takes the accent.
 
 The age column is the holding process's age: a process that waited for the lock, or a long-lived kernel, reads older than its hold.
 
@@ -134,7 +134,7 @@ Run `boardhog --help` for all flags.
 ```text
 Unavailable Boards
 
-2.21  ● alice        12m 04s    run_tier.sh     (frame_1[0])  +1 waiting
+2.21  ● alice        24m 04s    run_tier.sh     (frame_1[0])  +1 waiting
 2.24  ● hidden       @12:59?    -               (frame_1[3])  pid 2373047 exited, lock held
 ```
 
@@ -143,7 +143,7 @@ Unavailable Boards
 ```text
 Board Status
 
-2.21  ● alice        12m 04s    run_tier.sh     (frame_1[0])  +1 waiting
+2.21  ● alice        24m 04s    run_tier.sh     (frame_1[0])  +1 waiting
 2.23  ? frame_1[2] (no BOARD_192_0_2_23.lock)
 
 free  2.22 2.25-2.29
@@ -154,7 +154,7 @@ free  2.22 2.25-2.29
 ```text
 Board Status
 
-2.21  long    alice        12m 04s    run_tier.sh     (frame_1[0])  +1 waiting
+2.21  long    alice        24m 04s    run_tier.sh     (frame_1[0])  +1 waiting
 2.22  free    frame_1[1]
 2.23  missing frame_1[2] (no BOARD_192_0_2_23.lock)
 ```
@@ -162,15 +162,15 @@ Board Status
 Boards cabled into one machine (`CABLED_GROUPS` in `boardhog.py`) get a bracket when one process holds them all, drawn `/`, `|`, `\` under `--plain`:
 
 ```text
-2.21 ┌● alice        12m 04s    run_tier.sh     (frame_1[0])
-2.22 ├● alice        12m 04s    run_tier.sh     (frame_1[1])
-2.23 └● alice        12m 04s    run_tier.sh     (frame_1[2])
+2.21 ┌● alice        24m 04s    run_tier.sh     (frame_1[0])
+2.22 ├● alice        24m 04s    run_tier.sh     (frame_1[1])
+2.23 └● alice        24m 04s    run_tier.sh     (frame_1[2])
 ```
 
 `--details`:
 
 ```text
-192.0.2.21      (BOARD_192_0_2_21.lock): locked by alice (PID=1234, CMD=run_tier.sh) for 12m 04s
+192.0.2.21      (BOARD_192_0_2_21.lock): locked by alice (PID=1234, CMD=run_tier.sh) for 24m 04s
     waiting: bob (PID=1301, CMD=flock) for 2m 36s
 192.0.2.24      (BOARD_192_0_2_24.lock): locked, holder PID=2373047 exited, lock held by no fd this reader can read, lock file opened 12:59
 ```
@@ -178,6 +178,6 @@ Boards cabled into one machine (`CABLED_GROUPS` in `boardhog.py`) get a bracket 
 `--json`, one object per board (abridged here). `lock_mtime` is ISO time with the local offset. A holder carries `script`, `alive`, `source` (`proc` a PID `/proc/locks` records, `fd` the reader's own process with the file open, `none` a held lock whose recorded PIDs exited and that no descriptor the reader can read holds), `dead_pid` (the recorded PID that exited, else `null`) and `hidden` (`true` for source `none`, whose `user` stays `?`, else `false`); `waiters` lists blocked processes in the holder's shape. `stm` is the frame's STM lock (`lock_name`, `lock_path`, `lock_file_exists`, `state`, `holder`, `waiters`, shaped as the board's own), `null` for a machine without an IPv4 `STM_IP`, and `waiting_on_stm` is `true` when the board's holder is blocked on it. Both are present with or without `--stm`. `stm_probe` is the frame's last controller check under `--stm` (`state`, `icmp`, `udp_ms` or `null`, `checked_at` in UTC), else `null`. The output stays a list of boards:
 
 ```json
-[{"ip":"192.0.2.21","lock_mtime":"2026-10-06T12:59:54+02:00","state":"long","holder":{"pid":"1234","user":"alice","command":"bash","script":"run_tier.sh","age_seconds":724,"age":"12m 04s","alive":true,"source":"proc","dead_pid":null,"hidden":false},"waiters":[{"pid":"1301","user":"bob","command":"flock","script":"flock","age_seconds":156,"age":"2m 36s","alive":true,"source":"proc","dead_pid":null,"hidden":false}]}]
+[{"ip":"192.0.2.21","lock_mtime":"2026-10-06T12:59:54+02:00","state":"long","holder":{"pid":"1234","user":"alice","command":"bash","script":"run_tier.sh","age_seconds":1444,"age":"24m 04s","alive":true,"source":"proc","dead_pid":null,"hidden":false},"waiters":[{"pid":"1301","user":"bob","command":"flock","script":"flock","age_seconds":156,"age":"2m 36s","alive":true,"source":"proc","dead_pid":null,"hidden":false}]}]
 ```
 

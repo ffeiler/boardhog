@@ -53,6 +53,8 @@ STATE_WIDTH = max(len(state) for state in SYMBOLS)
 SYMBOL_WIDTH = max(len(symbol) for symbol in SYMBOLS.values())
 # A holder that exited without a usable open time has no age; it reads medium so an unknown age never lands in long.
 DEAD_UNKNOWN_STATE = "medium"
+# A holder older than this reads long, its dot in the accent; --long-after sets it in minutes.
+LONG_AFTER_SECONDS = 15 * 60
 
 # Terminal styles: bold, dim and one accent, #e46212, always bold so it survives a terminal without colour.
 BOLD = "\x1b[1m"
@@ -631,7 +633,7 @@ def process_age_seconds(pid: str) -> int | None:
 
 
 def age_state(seconds: int | None) -> str:
-    if seconds is None or seconds > 300:
+    if seconds is None or seconds > LONG_AFTER_SECONDS:
         return "long"
     if seconds >= 60:
         return "medium"
@@ -1274,6 +1276,13 @@ def positive_seconds(text: str) -> float:
     return value
 
 
+def positive_minutes(text: str) -> float:
+    try:
+        return positive_seconds(text)
+    except argparse.ArgumentTypeError:
+        raise argparse.ArgumentTypeError(f"must be a positive number of minutes: {text!r}") from None
+
+
 def parser() -> argparse.ArgumentParser:
     cli = argparse.ArgumentParser(description="Monitor py-spinnaker2 board locks")
     cli.add_argument("--config-root", type=Path, help="SpiNNaker config root")
@@ -1285,6 +1294,13 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--full-ip", action="store_true", help="show full IPs")
     cli.add_argument("--pid", action="store_true", help="show PIDs in compact output")
     cli.add_argument("--plain", action="store_true", help="print states as words: free, short, medium, long, missing")
+    cli.add_argument(
+        "--long-after",
+        type=positive_minutes,
+        default=LONG_AFTER_SECONDS / 60,
+        metavar="MINUTES",
+        help="a holder older than MINUTES reads long, its dot in the accent (default %(default)g)",
+    )
     cli.add_argument("--json", action="store_true", help="emit JSON")
     cli.add_argument("--pretty", action="store_true", help="pretty-print JSON")
     cli.add_argument("--no-header", action="store_true", help="omit compact/detail header")
@@ -1308,7 +1324,9 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    global LONG_AFTER_SECONDS
     args = parser().parse_args()
+    LONG_AFTER_SECONDS = args.long_after * 60
     try:
         # Without a terminal there is nothing to redraw, so --watch prints one static frame.
         if args.watch is not None and not args.json and sys.stdout.isatty():

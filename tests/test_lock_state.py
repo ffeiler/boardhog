@@ -10,6 +10,8 @@ import io
 import tempfile
 from pathlib import Path
 
+import pytest
+
 import boardhog as bh
 
 CONFIG = """\
@@ -75,6 +77,22 @@ def test_status_symbols():
     assert bh.status_symbol("free", plain=False) == "○"
     assert all(bh.status_symbol(state, plain=False) == "●" for state in ("short", "medium", "long"))
     assert bh.status_symbol("long", plain=True) == "long"
+
+
+def test_long_starts_after_the_long_after_age(monkeypatch):
+    assert bh.age_state(15 * 60) == "medium"
+    assert bh.age_state(15 * 60 + 1) == "long"
+    monkeypatch.setattr(bh, "LONG_AFTER_SECONDS", 120)
+    assert bh.age_state(120) == "medium"
+    assert bh.age_state(121) == "long"
+
+
+def test_long_after_flag_takes_positive_minutes():
+    assert bh.parser().parse_args([]).long_after == 15
+    assert bh.parser().parse_args(["--long-after", "2.5"]).long_after == 2.5
+    for bad in ("0", "-1", "nan", "soon"):
+        with pytest.raises(SystemExit):
+            bh.parser().parse_args(["--long-after", bad])
 
 
 STATES = ("free", "short", "medium", "long", "missing")
