@@ -87,13 +87,13 @@ STM 192.0.2.2   (STM_192_0_2_2.lock): locked by alice (PID=1234, CMD=stm_boot_pr
     waiting: bob (PID=1301, CMD=run_pytest_script.py) for 1h 24m
 ```
 
-Under `--stm` boardhog also checks each frame's STM controller: one ICMP echo through the system `ping`, then, only while the frame's STM lock is free, one firmware-status read (`0x64`) over UDP with that lock taken for the one exchange, a quarter second at most. A frame whose STM lock is held skips the read (`lock held`), and a frame without an STM lock file is not checked. A static run checks once; the live view checks when `s` turns on, or at its start under `--stm`, then every 60 s while `s` stays on, in the background so a slow ping never holds up a redraw. Only a fault shows, in the accent at the end of the `stm` line, which then appears even with no STM lock held:
+Under `--stm` boardhog also checks each frame's STM controller: three ICMP echoes 0.2 s apart through the system `ping`, then, only while the frame's STM lock is free, one firmware-status read (`0x64`) over UDP with that lock taken for the one exchange, a quarter second at most. A frame whose STM lock is held skips the read (`lock held`), and a frame without an STM lock file is not checked. A static run checks once; the live view checks when `s` turns on, or at its start under `--stm`, then every 60 s while `s` stays on, in the background so a slow ping never holds up a redraw. Only a fault shows, in the accent at the end of the `stm` line, which then appears even with no STM lock held:
 
 ```text
 stm  carol (frame_2)  frame_1 STM unreachable
 ```
 
-`unreachable` is a controller that misses the echo, `no reply` one that answers the echo but not the read within 0.25 s, as hung firmware does. `--details --stm` lists every checked frame and gives its STM entry a line with the last result and its age: `probe: ok in 0.14 ms, 12s ago`, or `lock held`, `unreachable` or `no reply`.
+`unreachable` is a controller that answers none of the three echoes, `no reply` one that answers an echo but not the read within 0.25 s, as hung firmware does. `--details --stm` lists every checked frame and gives its STM entry a line with the last result and its age: `probe: ok in 0.14 ms, 12s ago`, or `lock held`, `unreachable` or `no reply`.
 
 Each read overwrites the controller's single reply address, so it waits for the STM lock; boardhog sends no other request and no SNMP. Another boardhog can catch the check holding the STM lock.
 

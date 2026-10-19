@@ -46,7 +46,7 @@ VALID = struct.pack("<BBBBIII", 0, 0x64, 0, 0, 0x42424D50, 0, 0x722ACCE7)
 
 
 def ping_argv(ip):
-    return ["ping", "-n", "-c", "1", "-W", "1", ip]
+    return ["ping", "-n", "-c", "3", "-i", "0.2", "-W", "1", ip]
 
 
 class Screen(io.StringIO):
@@ -133,6 +133,20 @@ def test_a_ping_that_cannot_run_reads_unreachable(world, network, error):
     network.ping_error = error
     assert bh.probe_stm("192.0.2.2", world.stm).state == "unreachable"
     assert network.sent == []
+
+
+def test_the_echo_check_is_three_pings_within_the_subprocess_timeout(monkeypatch):
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((list(argv), kwargs))
+        return subprocess.CompletedProcess(argv, 1, b"", b"")
+
+    monkeypatch.setattr(bh, "subprocess", SimpleNamespace(run=run, SubprocessError=subprocess.SubprocessError))
+    assert bh.ping("192.0.2.2") is False
+    assert calls == [(ping_argv("192.0.2.2"), {"capture_output": True, "timeout": 5})]
+    # Three echoes 0.2 s apart and 1 s for the last answer stay well inside the subprocess timeout.
+    assert 2 * 0.2 + 1 < calls[0][1]["timeout"]
 
 
 def test_a_held_stm_lock_skips_the_read(world, network):

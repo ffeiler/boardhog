@@ -14,7 +14,7 @@ VALID_REPLY = struct.pack("<BBBBIII", 0, 0x64, 0, 0, 0x42424D50, 0, 0x722ACCE7)
 
 
 class Network:
-    """Fake ping and UDP. `down` addresses miss the echo, `replies` maps an address to its reply (None times out) and
+    """Fake ping and UDP. `down` addresses miss every echo, `replies` maps an address to its reply (None times out) and
     `sources` to where the reply comes from; `runs` and `sent` record each ping command and UDP request. A ping waits
     on `gate`, an Event, when one is set, and raises `ping_error` when one is set."""
 

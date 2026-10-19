@@ -166,11 +166,11 @@ class LockPids:
 class StmProbe:
     """One check of a frame's STM controller."""
 
-    # ok, lock held (the read skipped), unreachable (no ICMP reply) or no reply (ICMP answered, the read did not).
+    # ok, lock held (the read skipped), unreachable (no echo answered) or no reply (ICMP answered, the read did not).
     state: str
     icmp: bool
     udp_ms: float | None
-    # time.time() once the echo answered or timed out.
+    # time.time() once the echoes answered or timed out.
     checked_at: float
 
 
@@ -413,9 +413,11 @@ def stm_rows(data: list[Row]) -> list[Row]:
 
 
 def ping(ip: str) -> bool:
-    """One ICMP echo through the system ping, which needs no raw socket or root of its own."""
+    """Three ICMP echoes 0.2 s apart through the system ping, which needs no raw socket or root of its own. One answer
+    is enough, so a single lost echo does not read as unreachable; with none, ping gives up 1 s after the last."""
     try:
-        return subprocess.run(["ping", "-n", "-c", "1", "-W", "1", ip], capture_output=True, timeout=5).returncode == 0
+        argv = ["ping", "-n", "-c", "3", "-i", "0.2", "-W", "1", ip]
+        return subprocess.run(argv, capture_output=True, timeout=5).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 
@@ -439,7 +441,7 @@ def stm_status_ms(ip: str) -> float | None:
 
 
 def probe_stm(ip: str, lock_path: Path) -> StmProbe:
-    """One check of a frame's STM controller: an ICMP echo, then, only while the frame's STM lock is free, one
+    """One check of a frame's STM controller: three ICMP echoes, then, only while the frame's STM lock is free, one
     firmware-status read with that lock taken for the one exchange."""
     icmp = ping(ip)
     checked_at = time.time()
